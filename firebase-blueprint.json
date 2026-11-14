@@ -66,6 +66,18 @@
       "schema": { "type": "object" },
       "description": "Sales invoices"
     },
+    "/purchases/{purchaseId}": {
+      "schema": { "type": "object" },
+      "description": "Stock purchase records"
+    },
+    "/stock_movements/{movementId}": {
+      "schema": { "type": "object" },
+      "description": "Inventory stock movement ledger"
+    },
+    "/payments/{paymentId}": {
+      "schema": { "type": "object" },
+      "description": "Customer and supplier payment records"
+    },
     "/expenses/{expenseId}": {
       "schema": { "type": "object" },
       "description": "Shop operating expenses"

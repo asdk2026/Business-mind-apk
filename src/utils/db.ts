@@ -23,7 +23,106 @@ const STORAGE_KEYS = {
   SETTINGS: 'bm_settings_v1',
   SYNC_LOGS: 'bm_sync_logs_v1',
   CATEGORIES: 'bm_categories_v1',
+  HAS_USER_DATA: 'bm_has_user_data_v1',
+  PENDING_CLOUD_SYNC: 'bm_pending_cloud_sync_v1',
+  CACHED_AUTH_USER: 'bm_cached_auth_user_v1',
+  CACHED_USERS_LIST: 'bm_cached_users_list_v1',
+  DELETED_CLOUD_QUEUE: 'bm_deleted_cloud_queue_v1',
 };
+
+const DATA_MIRROR_KEYS = [
+  STORAGE_KEYS.PRODUCTS,
+  STORAGE_KEYS.CUSTOMERS,
+  STORAGE_KEYS.SUPPLIERS,
+  STORAGE_KEYS.INVOICES,
+  STORAGE_KEYS.PURCHASES,
+  STORAGE_KEYS.STOCK_MOVEMENTS,
+  STORAGE_KEYS.PAYMENTS,
+  STORAGE_KEYS.EXPENSES,
+  STORAGE_KEYS.SETTINGS,
+  STORAGE_KEYS.SYNC_LOGS,
+  STORAGE_KEYS.CATEGORIES,
+  STORAGE_KEYS.HAS_USER_DATA,
+  STORAGE_KEYS.PENDING_CLOUD_SYNC,
+  STORAGE_KEYS.CACHED_AUTH_USER,
+  STORAGE_KEYS.CACHED_USERS_LIST,
+  STORAGE_KEYS.DELETED_CLOUD_QUEUE,
+];
+
+const IDB_NAME = 'BusinessMindMirrorDB';
+const IDB_STORE = 'kv_backup';
+
+function openMirrorDB(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function mirrorToIndexedDB(key: string, jsonValue: string): void {
+  openMirrorDB()
+    .then((db) => {
+      if (!db) return;
+      try {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(jsonValue, key);
+      } catch {
+        // Ignore IndexedDB quota/availability errors
+      }
+    })
+    .catch(() => {});
+}
+
+export async function hydrateLocalStorageFromIndexedDB(): Promise<void> {
+  const db = await openMirrorDB();
+  if (!db) return;
+
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      let remaining = DATA_MIRROR_KEYS.length;
+      if (remaining === 0) {
+        resolve();
+        return;
+      }
+
+      for (const key of DATA_MIRROR_KEYS) {
+        const existing = localStorage.getItem(key);
+        const req = store.get(key);
+        req.onsuccess = () => {
+          try {
+            if (!existing && typeof req.result === 'string' && req.result.length > 0) {
+              localStorage.setItem(key, req.result);
+            }
+          } catch {
+            // ignore
+          }
+          remaining -= 1;
+          if (remaining === 0) resolve();
+        };
+        req.onerror = () => {
+          remaining -= 1;
+          if (remaining === 0) resolve();
+        };
+      }
+    } catch {
+      resolve();
+    }
+  });
+}
 
 export const INITIAL_CATEGORIES: string[] = [
   'Grains & Rice',
@@ -582,17 +681,69 @@ export function getLocal<T>(key: string, defaultValue: T): T {
 
 export function setLocal<T>(key: string, value: T): void {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    const serialized = JSON.stringify(value);
+    localStorage.setItem(key, serialized);
+    mirrorToIndexedDB(key, serialized);
   } catch (err) {
     console.error('Local storage write failure:', err);
   }
+}
+
+export function hasRealUserData(): boolean {
+  return localStorage.getItem(STORAGE_KEYS.HAS_USER_DATA) === 'true';
+}
+
+export function markUserHasRealData(): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.HAS_USER_DATA, 'true');
+    mirrorToIndexedDB(STORAGE_KEYS.HAS_USER_DATA, 'true');
+  } catch {
+    // ignore
+  }
+}
+
+export function hasPendingCloudSync(): boolean {
+  return localStorage.getItem(STORAGE_KEYS.PENDING_CLOUD_SYNC) === 'true';
+}
+
+export function setPendingCloudSync(pending: boolean): void {
+  try {
+    const val = pending ? 'true' : 'false';
+    localStorage.setItem(STORAGE_KEYS.PENDING_CLOUD_SYNC, val);
+    mirrorToIndexedDB(STORAGE_KEYS.PENDING_CLOUD_SYNC, val);
+  } catch {
+    // ignore
+  }
+}
+
+export interface QueuedCloudDeletion {
+  collection: string;
+  id: string;
+}
+
+export function queueCloudDeletion(collection: string, id: string): void {
+  const current = getLocal<QueuedCloudDeletion[]>(STORAGE_KEYS.DELETED_CLOUD_QUEUE, []);
+  if (!current.some((item) => item.collection === collection && item.id === id)) {
+    setLocal(STORAGE_KEYS.DELETED_CLOUD_QUEUE, [...current, { collection, id }]);
+  }
+}
+
+export function getQueuedCloudDeletions(): QueuedCloudDeletion[] {
+  return getLocal<QueuedCloudDeletion[]>(STORAGE_KEYS.DELETED_CLOUD_QUEUE, []);
+}
+
+export function clearQueuedCloudDeletions(): void {
+  setLocal<QueuedCloudDeletion[]>(STORAGE_KEYS.DELETED_CLOUD_QUEUE, []);
 }
 
 /**
  * Initialize all stores if empty
  */
 export function initDatabase() {
-  if (!localStorage.getItem(STORAGE_KEYS.PRODUCTS)) {
+  const hadExistingProducts = Boolean(localStorage.getItem(STORAGE_KEYS.PRODUCTS));
+  const hadExistingInvoices = Boolean(localStorage.getItem(STORAGE_KEYS.INVOICES));
+
+  if (!hadExistingProducts) {
     setLocal(STORAGE_KEYS.PRODUCTS, INITIAL_PRODUCTS);
   }
   if (!localStorage.getItem(STORAGE_KEYS.CUSTOMERS)) {
@@ -601,7 +752,7 @@ export function initDatabase() {
   if (!localStorage.getItem(STORAGE_KEYS.SUPPLIERS)) {
     setLocal(STORAGE_KEYS.SUPPLIERS, INITIAL_SUPPLIERS);
   }
-  if (!localStorage.getItem(STORAGE_KEYS.INVOICES)) {
+  if (!hadExistingInvoices) {
     setLocal(STORAGE_KEYS.INVOICES, INITIAL_INVOICES);
   }
   if (!localStorage.getItem(STORAGE_KEYS.EXPENSES)) {
@@ -616,6 +767,25 @@ export function initDatabase() {
   if (!localStorage.getItem(STORAGE_KEYS.CATEGORIES)) {
     setLocal(STORAGE_KEYS.CATEGORIES, INITIAL_CATEGORIES);
   }
+
+  // Upgrade safety: if upgrading from an older version that already had customized local records, preserve them
+  if (!hasRealUserData() && (hadExistingProducts || hadExistingInvoices)) {
+    const prods = getLocal<Product[]>(STORAGE_KEYS.PRODUCTS, []);
+    const invs = getLocal<Invoice[]>(STORAGE_KEYS.INVOICES, []);
+    const custs = getLocal<Customer[]>(STORAGE_KEYS.CUSTOMERS, []);
+    const purs = getLocal<Purchase[]>(STORAGE_KEYS.PURCHASES, []);
+    const isCustomized =
+      prods.length !== INITIAL_PRODUCTS.length ||
+      invs.length !== INITIAL_INVOICES.length ||
+      custs.length !== INITIAL_CUSTOMERS.length ||
+      purs.length > 0 ||
+      prods.some((p) => !INITIAL_PRODUCTS.some((ip) => ip.id === p.id));
+    if (isCustomized) {
+      markUserHasRealData();
+      setPendingCloudSync(true);
+    }
+  }
+
   // Clean up legacy local admin storage keys if present
   localStorage.removeItem('bm_users_v1');
   localStorage.removeItem('bm_current_user_v1');

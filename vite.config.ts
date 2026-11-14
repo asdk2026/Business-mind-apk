@@ -47,6 +47,24 @@ export default defineConfig(() => {
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+          cleanupOutdatedCaches: true,
+          clientsClaim: true,
+          skipWaiting: true,
+          navigateFallback: '/index.html',
+          navigateFallbackDenylist: [/^\/__\/auth/],
+          runtimeCaching: [
+            {
+              urlPattern: /^https:\/\/fonts\.(?:googleapis|gstatic)\.com\/.*/i,
+              handler: 'StaleWhileRevalidate',
+              options: {
+                cacheName: 'google-fonts-cache',
+                expiration: {
+                  maxEntries: 20,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+              },
+            },
+          ],
         },
         devOptions: {
           enabled: true,

@@ -30,6 +30,13 @@ import {
   INITIAL_SYNC_LOGS,
   INITIAL_CATEGORIES,
   initDatabase,
+  hasRealUserData,
+  markUserHasRealData,
+  hasPendingCloudSync,
+  setPendingCloudSync,
+  queueCloudDeletion,
+  getQueuedCloudDeletions,
+  clearQueuedCloudDeletions,
 } from '../utils/db';
 import {
   getFirebaseAuth,
@@ -214,7 +221,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
   const [firebaseSyncStatus, setFirebaseSyncStatus] = useState<
     'connected' | 'syncing' | 'synced' | 'error' | 'disconnected'
-  >('connected');
+  >(() => (typeof navigator !== 'undefined' && !navigator.onLine ? 'disconnected' : 'connected'));
   const [lastFirebaseSync, setLastFirebaseSync] = useState<string | null>(() => {
     return localStorage.getItem('bm_last_fb_sync') || null;
   });
@@ -310,16 +317,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, []);
 
-  // Subscribe to all users list ONLY when signed in as Admin
+  // Subscribe to all users list ONLY when signed in as Admin (with offline cache fallback)
   useEffect(() => {
     if (!currentUser || currentUser.role !== 'admin') {
       setUsers([]);
       return;
     }
 
+    const cachedUsers = getLocal<UserAccount[]>(STORAGE_KEYS.CACHED_USERS_LIST, []);
+    if (cachedUsers.length > 0) {
+      setUsers(cachedUsers);
+    }
+
     const unsubscribeUsers = subscribeToAllUsers(
       (list) => {
-        setUsers(list);
+        if (list.length > 0 || navigator.onLine) {
+          setUsers(list);
+        }
       },
       (err) => {
         console.warn('Users subscription warning:', err);
@@ -432,6 +446,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSettings((prev) => {
       const updated = { ...prev, ...newSettings };
       setLocal(STORAGE_KEYS.SETTINGS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       return updated;
     });
   }, []);
@@ -470,6 +486,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = [newProduct, ...products];
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
       return newProduct;
     },
@@ -483,6 +501,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [products]
@@ -493,6 +513,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = products.filter((p) => p.id !== id);
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
+      markUserHasRealData();
+      queueCloudDeletion('products', id);
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [products]
@@ -514,6 +537,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = [duplicated, ...products];
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [products]
@@ -533,6 +558,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = [newCust, ...customers];
       setCustomers(updated);
       setLocal(STORAGE_KEYS.CUSTOMERS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
       return newCust;
     },
@@ -544,6 +571,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = customers.map((c) => (c.id === cust.id ? cust : c));
       setCustomers(updated);
       setLocal(STORAGE_KEYS.CUSTOMERS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [customers]
@@ -554,6 +583,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = customers.filter((c) => c.id !== id);
       setCustomers(updated);
       setLocal(STORAGE_KEYS.CUSTOMERS, updated);
+      markUserHasRealData();
+      queueCloudDeletion('customers', id);
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [customers]
@@ -617,6 +649,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
 
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [customers, payments, invoices, settings.business_id]
@@ -636,6 +670,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = [newSupp, ...suppliers];
       setSuppliers(updated);
       setLocal(STORAGE_KEYS.SUPPLIERS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
       return newSupp;
     },
@@ -647,6 +683,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = suppliers.map((s) => (s.id === supp.id ? supp : s));
       setSuppliers(updated);
       setLocal(STORAGE_KEYS.SUPPLIERS, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [suppliers]
@@ -681,6 +719,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updatedPayments = [newPayment, ...payments];
       setPayments(updatedPayments);
       setLocal(STORAGE_KEYS.PAYMENTS, updatedPayments);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [suppliers, payments, settings.business_id]
@@ -786,6 +826,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setLocal(STORAGE_KEYS.PAYMENTS, allPayments);
       }
 
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
       return newInvoice;
     },
@@ -863,6 +905,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
 
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [invoices, products, settings.business_id, stockMovements, customers]
@@ -942,6 +986,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
 
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
       return newPurchase;
     },
@@ -1006,6 +1052,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const allMovements = [movement, ...stockMovements];
       setStockMovements(allMovements);
       setLocal(STORAGE_KEYS.STOCK_MOVEMENTS, allMovements);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [products, settings.allow_negative_stock, settings.business_id, stockMovements]
@@ -1022,6 +1070,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = [newExp, ...expenses];
       setExpenses(updated);
       setLocal(STORAGE_KEYS.EXPENSES, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       setSyncStatus('pending');
       return newExp;
     },
@@ -1033,6 +1083,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const updated = expenses.filter((e) => e.id !== id);
       setExpenses(updated);
       setLocal(STORAGE_KEYS.EXPENSES, updated);
+      markUserHasRealData();
+      queueCloudDeletion('expenses', id);
+      setPendingCloudSync(true);
       setSyncStatus('pending');
     },
     [expenses]
@@ -1096,6 +1149,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setExpenses(data.expenses);
         setLocal(STORAGE_KEYS.EXPENSES, data.expenses);
       }
+      markUserHasRealData();
+      setPendingCloudSync(true);
       return true;
     } catch {
       return false;
@@ -1218,6 +1273,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (prev.includes(trimmed)) return prev;
       const updated = [...prev, trimmed];
       setLocal(STORAGE_KEYS.CATEGORIES, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       return updated;
     });
   }, []);
@@ -1226,23 +1283,57 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCategories((prev) => {
       const updated = prev.filter((c) => c !== catToDelete);
       setLocal(STORAGE_KEYS.CATEGORIES, updated);
+      markUserHasRealData();
+      setPendingCloudSync(true);
       return updated;
     });
   }, []);
 
+  // Always keep a ref to latest store state so async auto-sync & reconnect handlers never push stale state
+  const latestStoreRef = useRef({
+    products,
+    customers,
+    suppliers,
+    invoices,
+    purchases,
+    stockMovements,
+    payments,
+    expenses,
+    categories,
+    settings,
+  });
+  useEffect(() => {
+    latestStoreRef.current = {
+      products,
+      customers,
+      suppliers,
+      invoices,
+      purchases,
+      stockMovements,
+      payments,
+      expenses,
+      categories,
+      settings,
+    };
+  }, [products, customers, suppliers, invoices, purchases, stockMovements, payments, expenses, categories, settings]);
+
   const syncToFirebase = useCallback(async (): Promise<boolean> => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setFirebaseSyncStatus('disconnected');
+      setPendingCloudSync(true);
+      return false;
+    }
     setFirebaseSyncStatus('syncing');
     try {
+      const snapshot = latestStoreRef.current;
       const res = await syncStoreToFirebase({
-        products,
-        customers,
-        suppliers,
-        invoices,
-        expenses,
-        categories,
-        settings,
+        ...snapshot,
+        deletedRefs: getQueuedCloudDeletions(),
       });
       if (res.success) {
+        setPendingCloudSync(false);
+        clearQueuedCloudDeletions();
+        setSyncStatus('synced');
         setFirebaseSyncStatus('synced');
         setLastFirebaseSync(res.syncedAt);
         localStorage.setItem('bm_last_fb_sync', res.syncedAt);
@@ -1255,25 +1346,129 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setFirebaseSyncStatus('error');
       return false;
     }
-  }, [products, customers, suppliers, invoices, expenses, categories, settings]);
+  }, []);
 
   const syncFromFirebase = useCallback(async (): Promise<boolean> => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setFirebaseSyncStatus('disconnected');
+      return false;
+    }
     setFirebaseSyncStatus('syncing');
     try {
       const res = await fetchStoreFromFirebase();
       if (res.success && res.data) {
-        if (res.data.products && res.data.products.length > 0) {
-          setProducts(res.data.products);
-          setLocal(STORAGE_KEYS.PRODUCTS, res.data.products);
+        const cloud = res.data;
+        const localAlreadyHasUserEdits = hasRealUserData();
+        const deletedQueue = getQueuedCloudDeletions();
+
+        const mergeList = <T extends { id: string; updated_at?: string; created_at?: string; date?: string; timestamp?: string }>(
+          localItems: T[],
+          cloudItems: T[] | undefined,
+          collectionName: string
+        ): T[] | null => {
+          if (!cloudItems || cloudItems.length === 0) return null;
+          const deletedSet = new Set(
+            deletedQueue.filter((d) => d.collection === collectionName).map((d) => d.id)
+          );
+          const filteredCloud = cloudItems.filter((item) => !deletedSet.has(item.id));
+          if (!localAlreadyHasUserEdits) {
+            return filteredCloud;
+          }
+          const byId = new Map<string, T>();
+          filteredCloud.forEach((item) => byId.set(item.id, item));
+          localItems.forEach((localItem) => {
+            const existing = byId.get(localItem.id);
+            if (!existing) {
+              byId.set(localItem.id, localItem);
+            } else {
+              const localTs = Date.parse(localItem.updated_at || localItem.created_at || localItem.date || localItem.timestamp || '') || 0;
+              const cloudTs = Date.parse(existing.updated_at || existing.created_at || existing.date || existing.timestamp || '') || 0;
+              if (localTs >= cloudTs) {
+                byId.set(localItem.id, localItem);
+              }
+            }
+          });
+          return Array.from(byId.values());
+        };
+
+        const snap = latestStoreRef.current;
+        let restoredAny = false;
+
+        const nextProducts = mergeList(snap.products, cloud.products, 'products');
+        if (nextProducts) {
+          setProducts(nextProducts);
+          setLocal(STORAGE_KEYS.PRODUCTS, nextProducts);
+          restoredAny = true;
         }
-        if (res.data.customers && res.data.customers.length > 0) {
-          setCustomers(res.data.customers);
-          setLocal(STORAGE_KEYS.CUSTOMERS, res.data.customers);
+
+        const nextCustomers = mergeList(snap.customers, cloud.customers, 'customers');
+        if (nextCustomers) {
+          setCustomers(nextCustomers);
+          setLocal(STORAGE_KEYS.CUSTOMERS, nextCustomers);
+          restoredAny = true;
         }
-        if (res.data.categories && res.data.categories.length > 0) {
-          setCategories(res.data.categories);
-          setLocal(STORAGE_KEYS.CATEGORIES, res.data.categories);
+
+        const nextSuppliers = mergeList(snap.suppliers, cloud.suppliers, 'suppliers');
+        if (nextSuppliers) {
+          setSuppliers(nextSuppliers);
+          setLocal(STORAGE_KEYS.SUPPLIERS, nextSuppliers);
+          restoredAny = true;
         }
+
+        const nextInvoices = mergeList(snap.invoices, cloud.invoices, 'invoices');
+        if (nextInvoices) {
+          setInvoices(nextInvoices);
+          setLocal(STORAGE_KEYS.INVOICES, nextInvoices);
+          restoredAny = true;
+        }
+
+        const nextPurchases = mergeList(snap.purchases, cloud.purchases, 'purchases');
+        if (nextPurchases) {
+          setPurchases(nextPurchases);
+          setLocal(STORAGE_KEYS.PURCHASES, nextPurchases);
+          restoredAny = true;
+        }
+
+        const nextMovements = mergeList(snap.stockMovements, cloud.stockMovements, 'stock_movements');
+        if (nextMovements) {
+          setStockMovements(nextMovements);
+          setLocal(STORAGE_KEYS.STOCK_MOVEMENTS, nextMovements);
+          restoredAny = true;
+        }
+
+        const nextPayments = mergeList(snap.payments, cloud.payments, 'payments');
+        if (nextPayments) {
+          setPayments(nextPayments);
+          setLocal(STORAGE_KEYS.PAYMENTS, nextPayments);
+          restoredAny = true;
+        }
+
+        const nextExpenses = mergeList(snap.expenses, cloud.expenses, 'expenses');
+        if (nextExpenses) {
+          setExpenses(nextExpenses);
+          setLocal(STORAGE_KEYS.EXPENSES, nextExpenses);
+          restoredAny = true;
+        }
+
+        if (cloud.categories && cloud.categories.length > 0) {
+          const nextCategories = localAlreadyHasUserEdits
+            ? Array.from(new Set([...snap.categories, ...cloud.categories]))
+            : cloud.categories;
+          setCategories(nextCategories);
+          setLocal(STORAGE_KEYS.CATEGORIES, nextCategories);
+          restoredAny = true;
+        }
+
+        if (cloud.settings && !localAlreadyHasUserEdits) {
+          setSettings(cloud.settings);
+          setLocal(STORAGE_KEYS.SETTINGS, cloud.settings);
+          restoredAny = true;
+        }
+
+        if (restoredAny) {
+          markUserHasRealData();
+        }
+
         setFirebaseSyncStatus('synced');
         const now = new Date().toISOString();
         setLastFirebaseSync(now);
@@ -1289,14 +1484,59 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, []);
 
-  // Automatic Firebase Sync effect: Only sync automatically when signed in and autoFirebaseSync is enabled
+  // Auto-restore cloud data on login / post-update boot, and flush offline queue first if pending
+  const restoredForUidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!currentUser) {
+      restoredForUidRef.current = null;
+      return;
+    }
+    if (!navigator.onLine) {
+      setFirebaseSyncStatus('disconnected');
+      return;
+    }
+    if (restoredForUidRef.current === currentUser.uid) return;
+    restoredForUidRef.current = currentUser.uid;
+
+    let cancelled = false;
+    (async () => {
+      if (hasPendingCloudSync()) {
+        await syncToFirebase();
+      }
+      if (!cancelled) {
+        await syncFromFirebase();
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser, syncToFirebase, syncFromFirebase]);
+
+  // Flush pending offline edits automatically when network comes back online
+  useEffect(() => {
+    if (isOnline && currentUser) {
+      if (hasPendingCloudSync() && autoFirebaseSync) {
+        syncToFirebase();
+      } else if (restoredForUidRef.current !== currentUser.uid) {
+        restoredForUidRef.current = currentUser.uid;
+        syncFromFirebase();
+      } else {
+        setFirebaseSyncStatus('connected');
+      }
+    } else if (!isOnline) {
+      setFirebaseSyncStatus('disconnected');
+    }
+  }, [isOnline, currentUser, autoFirebaseSync, syncToFirebase, syncFromFirebase]);
+
+  // Automatic Firebase Sync effect: Debounced cloud backup whenever local state changes while online
   const hasMountedFirebaseRef = useRef(false);
   useEffect(() => {
     if (!hasMountedFirebaseRef.current) {
       hasMountedFirebaseRef.current = true;
       return;
     }
-    if (!currentUser || !autoFirebaseSync || !navigator.onLine) return;
+    if (!currentUser || !autoFirebaseSync || !navigator.onLine || !hasPendingCloudSync()) return;
     const timer = setTimeout(() => {
       syncToFirebase();
     }, 2000);
@@ -1308,6 +1548,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     customers,
     suppliers,
     invoices,
+    purchases,
+    stockMovements,
+    payments,
     expenses,
     categories,
     settings,

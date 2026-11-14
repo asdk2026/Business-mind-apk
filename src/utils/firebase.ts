@@ -8,10 +8,16 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   updateProfile,
+  setPersistence,
+  indexedDBLocalPersistence,
+  browserLocalPersistence,
   User as FirebaseUser,
 } from 'firebase/auth';
 import {
   getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   collection,
   doc,
   getDoc,
@@ -30,6 +36,9 @@ import {
   Customer,
   Supplier,
   Invoice,
+  Purchase,
+  StockMovement,
+  PaymentRecord,
   Expense,
   BusinessSettings,
   UserAccount,
@@ -41,6 +50,12 @@ import {
   ADMIN_PERMISSIONS,
   normalizePermissions,
 } from './permissions';
+import {
+  STORAGE_KEYS,
+  getLocal,
+  setLocal,
+  QueuedCloudDeletion,
+} from './db';
 
 export const firebaseConfig = {
   apiKey: "AIzaSyDrOkYT_9cCZ7drK4WtsjNn4PVxWpuGBiU",
@@ -116,7 +131,16 @@ export function getSecondaryFirebaseApp(): FirebaseApp {
 
 export function getFirebaseFirestore(): Firestore {
   if (!firestoreInstance) {
-    firestoreInstance = getFirestore(getFirebaseApp());
+    const app = getFirebaseApp();
+    try {
+      firestoreInstance = initializeFirestore(app, {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      });
+    } catch {
+      firestoreInstance = getFirestore(app);
+    }
   }
   return firestoreInstance;
 }
@@ -124,6 +148,11 @@ export function getFirebaseFirestore(): Firestore {
 export function getFirebaseAuth(): Auth {
   if (!authInstance) {
     authInstance = getAuth(getFirebaseApp());
+    setPersistence(authInstance, indexedDBLocalPersistence).catch(() => {
+      if (authInstance) {
+        setPersistence(authInstance, browserLocalPersistence).catch(() => {});
+      }
+    });
   }
   return authInstance;
 }
@@ -133,6 +162,43 @@ export function getSecondaryFirebaseAuth(): Auth {
     secondaryAuthInstance = getAuth(getSecondaryFirebaseApp());
   }
   return secondaryAuthInstance;
+}
+
+export function getCachedAuthUser(uid?: string): UserAccount | null {
+  const cached = getLocal<UserAccount | null>(STORAGE_KEYS.CACHED_AUTH_USER, null);
+  if (!cached || !cached.isActive) return null;
+  if (uid && cached.uid !== uid) return null;
+  return {
+    ...cached,
+    permissions: normalizePermissions(cached.role, cached.permissions),
+  };
+}
+
+export function setCachedAuthUser(user: UserAccount | null): void {
+  if (!user) {
+    try {
+      localStorage.removeItem(STORAGE_KEYS.CACHED_AUTH_USER);
+      setLocal(STORAGE_KEYS.CACHED_AUTH_USER, null);
+    } catch {
+      // ignore
+    }
+    return;
+  }
+  setLocal(STORAGE_KEYS.CACHED_AUTH_USER, user);
+}
+
+function isOfflineOrNetworkError(error: any): boolean {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return true;
+  const code = String(error?.code || '').toLowerCase();
+  const msg = String(error?.message || '').toLowerCase();
+  return (
+    code === 'unavailable' ||
+    code === 'failed-precondition' ||
+    code === 'auth/network-request-failed' ||
+    msg.includes('offline') ||
+    msg.includes('unavailable') ||
+    msg.includes('network')
+  );
 }
 
 export async function testFirestoreConnection(): Promise<boolean> {
@@ -185,92 +251,117 @@ export function formatFirebaseAuthError(error: any): string {
  * a Firestore profile in `users/{uid}` or an Admin pre-authorization in `invited_users/{email}`.
  */
 export async function resolveAuthorizedUserProfile(fbUser: FirebaseUser): Promise<UserAccount> {
+  const cached = getCachedAuthUser(fbUser.uid);
+
+  // If offline right now, seamlessly allow previously authorized user via local cache
+  if (typeof navigator !== 'undefined' && !navigator.onLine && cached) {
+    return cached;
+  }
+
   const db = getFirebaseFirestore();
   const userEmail = (fbUser.email || '').toLowerCase().trim();
   const userRef = doc(db, 'users', fbUser.uid);
 
-  const snap = await getDoc(userRef);
-  if (snap.exists()) {
-    const data = snap.data() as UserAccount;
-    const normalized: UserAccount = {
-      ...data,
-      uid: fbUser.uid,
-      email: userEmail || data.email,
-      permissions: normalizePermissions(data.role, data.permissions),
-    };
-    if (!normalized.isActive) {
-      await signOut(getFirebaseAuth());
-      throw new Error('Your account has been disabled by an Administrator.');
-    }
-    await updateDoc(userRef, {
-      last_login: new Date().toISOString(),
-    }).catch(() => {});
-    return normalized;
-  }
-
-  // Root Admin bootstrap on first sign-in
-  if (userEmail === ROOT_ADMIN_EMAIL) {
-    const now = new Date().toISOString();
-    const adminProfile: UserAccount = {
-      uid: fbUser.uid,
-      name: fbUser.displayName || 'Primary Admin',
-      email: ROOT_ADMIN_EMAIL,
-      role: 'admin',
-      isActive: true,
-      permissions: structuredClone(ADMIN_PERMISSIONS),
-      created_at: now,
-      created_by: 'system_root',
-      updated_at: now,
-      last_login: now,
-    };
-    await setDoc(userRef, adminProfile);
-    await setDoc(doc(db, 'admins', fbUser.uid), {
-      uid: fbUser.uid,
-      email: ROOT_ADMIN_EMAIL,
-      created_at: now,
-    });
-    return adminProfile;
-  }
-
-  // Check if Admin pre-authorized this email
-  if (userEmail) {
-    const inviteRef = doc(db, 'invited_users', sanitizeEmailKey(userEmail));
-    const inviteSnap = await getDoc(inviteRef);
-    if (inviteSnap.exists()) {
-      const invite = inviteSnap.data() as Partial<UserAccount>;
-      const role: FirebaseUserRole = invite.role || 'user';
-      const now = new Date().toISOString();
-      const newProfile: UserAccount = {
+  try {
+    const snap = await getDoc(userRef);
+    if (snap.exists()) {
+      const data = snap.data() as UserAccount;
+      const normalized: UserAccount = {
+        ...data,
         uid: fbUser.uid,
-        name: fbUser.displayName || invite.name || userEmail.split('@')[0],
-        email: userEmail,
-        phone: invite.phone || '',
-        role,
-        isActive: invite.isActive !== false,
-        permissions: normalizePermissions(role, invite.permissions),
-        created_at: invite.created_at || now,
-        created_by: invite.created_by || 'admin',
+        email: userEmail || data.email,
+        permissions: normalizePermissions(data.role, data.permissions),
+      };
+      if (!normalized.isActive) {
+        setCachedAuthUser(null);
+        await signOut(getFirebaseAuth());
+        throw new Error('Your account has been disabled by an Administrator.');
+      }
+      setCachedAuthUser(normalized);
+      if (typeof navigator === 'undefined' || navigator.onLine) {
+        await updateDoc(userRef, {
+          last_login: new Date().toISOString(),
+        }).catch(() => {});
+      }
+      return normalized;
+    }
+
+    if (snap.metadata?.fromCache && cached) {
+      return cached;
+    }
+
+    // Root Admin bootstrap on first sign-in
+    if (userEmail === ROOT_ADMIN_EMAIL) {
+      const now = new Date().toISOString();
+      const adminProfile: UserAccount = {
+        uid: fbUser.uid,
+        name: fbUser.displayName || 'Primary Admin',
+        email: ROOT_ADMIN_EMAIL,
+        role: 'admin',
+        isActive: true,
+        permissions: structuredClone(ADMIN_PERMISSIONS),
+        created_at: now,
+        created_by: 'system_root',
         updated_at: now,
         last_login: now,
       };
-      await setDoc(userRef, newProfile);
-      if (role === 'admin') {
-        await setDoc(doc(db, 'admins', fbUser.uid), {
-          uid: fbUser.uid,
-          email: userEmail,
-          created_at: now,
-        });
-      }
-      await deleteDoc(inviteRef).catch(() => {});
-      return newProfile;
+      await setDoc(userRef, adminProfile);
+      await setDoc(doc(db, 'admins', fbUser.uid), {
+        uid: fbUser.uid,
+        email: ROOT_ADMIN_EMAIL,
+        created_at: now,
+      });
+      setCachedAuthUser(adminProfile);
+      return adminProfile;
     }
-  }
 
-  // Unauthorized: nobody except Admin can create accounts
-  await signOut(getFirebaseAuth());
-  throw new Error(
-    'Access Denied: Public registration is disabled. Only an Admin can create or authorize accounts.'
-  );
+    // Check if Admin pre-authorized this email
+    if (userEmail) {
+      const inviteRef = doc(db, 'invited_users', sanitizeEmailKey(userEmail));
+      const inviteSnap = await getDoc(inviteRef);
+      if (inviteSnap.exists()) {
+        const invite = inviteSnap.data() as Partial<UserAccount>;
+        const role: FirebaseUserRole = invite.role || 'user';
+        const now = new Date().toISOString();
+        const newProfile: UserAccount = {
+          uid: fbUser.uid,
+          name: fbUser.displayName || invite.name || userEmail.split('@')[0],
+          email: userEmail,
+          phone: invite.phone || '',
+          role,
+          isActive: invite.isActive !== false,
+          permissions: normalizePermissions(role, invite.permissions),
+          created_at: invite.created_at || now,
+          created_by: invite.created_by || 'admin',
+          updated_at: now,
+          last_login: now,
+        };
+        await setDoc(userRef, newProfile);
+        if (role === 'admin') {
+          await setDoc(doc(db, 'admins', fbUser.uid), {
+            uid: fbUser.uid,
+            email: userEmail,
+            created_at: now,
+          });
+        }
+        await deleteDoc(inviteRef).catch(() => {});
+        setCachedAuthUser(newProfile);
+        return newProfile;
+      }
+    }
+
+    // Unauthorized: nobody except Admin can create accounts
+    setCachedAuthUser(null);
+    await signOut(getFirebaseAuth());
+    throw new Error(
+      'Access Denied: Public registration is disabled. Only an Admin can create or authorize accounts.'
+    );
+  } catch (err: any) {
+    if (cached && isOfflineOrNetworkError(err)) {
+      return cached;
+    }
+    throw err;
+  }
 }
 
 export async function signInWithFirebaseEmail(email: string, password: string): Promise<UserAccount> {
@@ -334,6 +425,7 @@ export async function bootstrapRootAdminAccount(
       email: cleanEmail,
       created_at: now,
     });
+    setCachedAuthUser(adminProfile);
     return adminProfile;
   } catch (err: any) {
     throw new Error(formatFirebaseAuthError(err));
@@ -341,6 +433,8 @@ export async function bootstrapRootAdminAccount(
 }
 
 export async function signOutFirebase(): Promise<void> {
+  setCachedAuthUser(null);
+  setLocal(STORAGE_KEYS.CACHED_USERS_LIST, []);
   const auth = getFirebaseAuth();
   await signOut(auth);
 }
@@ -462,15 +556,26 @@ export function subscribeToCurrentUserProfile(
     userRef,
     (snap) => {
       if (!snap.exists()) {
+        // Never kick an authenticated offline user based on an empty local cache snapshot
+        if (snap.metadata.fromCache && (typeof navigator !== 'undefined' && !navigator.onLine || Boolean(getCachedAuthUser(uid)))) {
+          return;
+        }
+        setCachedAuthUser(null);
         onUpdate(null);
         return;
       }
       const data = snap.data() as UserAccount;
-      onUpdate({
+      const normalized: UserAccount = {
         ...data,
         uid,
         permissions: normalizePermissions(data.role, data.permissions),
-      });
+      };
+      if (normalized.isActive) {
+        setCachedAuthUser(normalized);
+      } else {
+        setCachedAuthUser(null);
+      }
+      onUpdate(normalized);
     },
     (error) => {
       handleFirestoreError(error, OperationType.GET, `users/${uid}`);
@@ -501,6 +606,9 @@ export function subscribeToAllUsers(
         const order = { admin: 0, manager: 1, user: 2 };
         return (order[a.role] ?? 3) - (order[b.role] ?? 3);
       });
+      if (list.length > 0) {
+        setLocal(STORAGE_KEYS.CACHED_USERS_LIST, list);
+      }
       onUpdate(list);
     },
     (error) => {
@@ -510,64 +618,120 @@ export function subscribeToAllUsers(
   );
 }
 
+type BatchOp =
+  | { type: 'set'; collectionName: string; docId: string; data: any }
+  | { type: 'delete'; collectionName: string; docId: string };
+
+async function commitOperationsInChunks(db: Firestore, ops: BatchOp[]): Promise<void> {
+  const CHUNK_SIZE = 400;
+  for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
+    const chunk = ops.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    for (const op of chunk) {
+      const ref = doc(db, op.collectionName, op.docId);
+      if (op.type === 'set') {
+        batch.set(ref, op.data);
+      } else {
+        batch.delete(ref);
+      }
+    }
+    await batch.commit();
+  }
+}
+
 /**
- * Sync entire local state to Cloud Firebase Firestore
+ * Sync entire local state (all collections, chunked safely) to Cloud Firebase Firestore
  */
 export async function syncStoreToFirebase(payload: {
   products: Product[];
   customers: Customer[];
   suppliers: Supplier[];
   invoices: Invoice[];
+  purchases: Purchase[];
+  stockMovements: StockMovement[];
+  payments: PaymentRecord[];
   expenses: Expense[];
   categories: string[];
   settings: BusinessSettings;
+  deletedRefs?: QueuedCloudDeletion[];
 }): Promise<{ success: boolean; message: string; syncedAt: string }> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return {
+      success: false,
+      message: 'Offline mode active. Changes are saved locally and will auto-sync when online.',
+      syncedAt: new Date().toISOString(),
+    };
+  }
+
   try {
     const db = getFirebaseFirestore();
-    const batch = writeBatch(db);
+    const ops: BatchOp[] = [];
 
-    const settingsDoc = doc(db, 'system', 'business_settings');
-    batch.set(settingsDoc, {
-      ...payload.settings,
-      updated_at_cloud: new Date().toISOString(),
+    ops.push({
+      type: 'set',
+      collectionName: 'system',
+      docId: 'business_settings',
+      data: {
+        ...payload.settings,
+        updated_at_cloud: new Date().toISOString(),
+      },
     });
 
-    const categoriesDoc = doc(db, 'system', 'categories');
-    batch.set(categoriesDoc, {
-      list: payload.categories,
-      updated_at_cloud: new Date().toISOString(),
+    ops.push({
+      type: 'set',
+      collectionName: 'system',
+      docId: 'categories',
+      data: {
+        list: payload.categories,
+        updated_at_cloud: new Date().toISOString(),
+      },
     });
 
-    payload.products.slice(0, 50).forEach((prod) => {
-      const prodRef = doc(db, 'products', prod.id);
-      batch.set(prodRef, prod);
+    payload.products.forEach((prod) => {
+      ops.push({ type: 'set', collectionName: 'products', docId: prod.id, data: prod });
     });
 
-    payload.customers.slice(0, 50).forEach((cust) => {
-      const custRef = doc(db, 'customers', cust.id);
-      batch.set(custRef, cust);
+    payload.customers.forEach((cust) => {
+      ops.push({ type: 'set', collectionName: 'customers', docId: cust.id, data: cust });
     });
 
-    payload.suppliers.slice(0, 50).forEach((supp) => {
-      const suppRef = doc(db, 'suppliers', supp.id);
-      batch.set(suppRef, supp);
+    payload.suppliers.forEach((supp) => {
+      ops.push({ type: 'set', collectionName: 'suppliers', docId: supp.id, data: supp });
     });
 
-    payload.invoices.slice(0, 50).forEach((inv) => {
-      const invRef = doc(db, 'invoices', inv.id);
-      batch.set(invRef, inv);
+    payload.invoices.forEach((inv) => {
+      ops.push({ type: 'set', collectionName: 'invoices', docId: inv.id, data: inv });
     });
 
-    payload.expenses.slice(0, 50).forEach((exp) => {
-      const expRef = doc(db, 'expenses', exp.id);
-      batch.set(expRef, exp);
+    payload.purchases.forEach((pur) => {
+      ops.push({ type: 'set', collectionName: 'purchases', docId: pur.id, data: pur });
     });
 
-    await batch.commit();
+    payload.stockMovements.forEach((mov) => {
+      ops.push({ type: 'set', collectionName: 'stock_movements', docId: mov.id, data: mov });
+    });
+
+    payload.payments.forEach((pay) => {
+      ops.push({ type: 'set', collectionName: 'payments', docId: pay.id, data: pay });
+    });
+
+    payload.expenses.forEach((exp) => {
+      ops.push({ type: 'set', collectionName: 'expenses', docId: exp.id, data: exp });
+    });
+
+    if (payload.deletedRefs && payload.deletedRefs.length > 0) {
+      payload.deletedRefs.forEach((del) => {
+        if (del.collection && del.id) {
+          ops.push({ type: 'delete', collectionName: del.collection, docId: del.id });
+        }
+      });
+    }
+
+    await commitOperationsInChunks(db, ops);
 
     return {
       success: true,
-      message: `Successfully synchronized ${payload.products.length} products, ${payload.invoices.length} invoices, and store metadata to Firebase project ${firebaseConfig.projectId}`,
+      message: `Successfully synchronized ${payload.products.length} products, ${payload.invoices.length} invoices, and all business records to Firebase project ${firebaseConfig.projectId}`,
       syncedAt: new Date().toISOString(),
     };
   } catch (error: any) {
@@ -581,7 +745,7 @@ export async function syncStoreToFirebase(payload: {
 }
 
 /**
- * Fetch and pull store data from Cloud Firebase Firestore
+ * Fetch and restore ALL store collections from Cloud Firebase Firestore
  */
 export async function fetchStoreFromFirebase(): Promise<{
   success: boolean;
@@ -590,6 +754,9 @@ export async function fetchStoreFromFirebase(): Promise<{
     customers?: Customer[];
     suppliers?: Supplier[];
     invoices?: Invoice[];
+    purchases?: Purchase[];
+    stockMovements?: StockMovement[];
+    payments?: PaymentRecord[];
     expenses?: Expense[];
     categories?: string[];
     settings?: BusinessSettings;
@@ -599,23 +766,62 @@ export async function fetchStoreFromFirebase(): Promise<{
   try {
     const db = getFirebaseFirestore();
 
-    const prodSnap = await getDocs(collection(db, 'products'));
+    const [
+      prodSnap,
+      custSnap,
+      suppSnap,
+      invSnap,
+      purSnap,
+      movSnap,
+      paySnap,
+      expSnap,
+      sysSnap,
+    ] = await Promise.all([
+      getDocs(collection(db, 'products')),
+      getDocs(collection(db, 'customers')),
+      getDocs(collection(db, 'suppliers')),
+      getDocs(collection(db, 'invoices')),
+      getDocs(collection(db, 'purchases')),
+      getDocs(collection(db, 'stock_movements')),
+      getDocs(collection(db, 'payments')),
+      getDocs(collection(db, 'expenses')),
+      getDocs(collection(db, 'system')),
+    ]);
+
     const products: Product[] = [];
-    prodSnap.forEach((d) => {
-      products.push(d.data() as Product);
-    });
+    prodSnap.forEach((d) => products.push(d.data() as Product));
 
-    const custSnap = await getDocs(collection(db, 'customers'));
     const customers: Customer[] = [];
-    custSnap.forEach((d) => {
-      customers.push(d.data() as Customer);
-    });
+    custSnap.forEach((d) => customers.push(d.data() as Customer));
 
-    const categoriesSnap = await getDocs(collection(db, 'system'));
+    const suppliers: Supplier[] = [];
+    suppSnap.forEach((d) => suppliers.push(d.data() as Supplier));
+
+    const invoices: Invoice[] = [];
+    invSnap.forEach((d) => invoices.push(d.data() as Invoice));
+
+    const purchases: Purchase[] = [];
+    purSnap.forEach((d) => purchases.push(d.data() as Purchase));
+
+    const stockMovements: StockMovement[] = [];
+    movSnap.forEach((d) => stockMovements.push(d.data() as StockMovement));
+
+    const payments: PaymentRecord[] = [];
+    paySnap.forEach((d) => payments.push(d.data() as PaymentRecord));
+
+    const expenses: Expense[] = [];
+    expSnap.forEach((d) => expenses.push(d.data() as Expense));
+
     let categories: string[] | undefined;
-    categoriesSnap.forEach((d) => {
-      if (d.id === 'categories' && Array.isArray(d.data().list)) {
-        categories = d.data().list;
+    let settings: BusinessSettings | undefined;
+    sysSnap.forEach((d) => {
+      const data = d.data();
+      if (d.id === 'categories' && Array.isArray(data?.list)) {
+        categories = data.list;
+      }
+      if (d.id === 'business_settings' && data?.business_name) {
+        const { updated_at_cloud: _ignore, ...cleanSettings } = data as any;
+        settings = cleanSettings as BusinessSettings;
       }
     });
 
@@ -624,9 +830,16 @@ export async function fetchStoreFromFirebase(): Promise<{
       data: {
         products: products.length > 0 ? products : undefined,
         customers: customers.length > 0 ? customers : undefined,
+        suppliers: suppliers.length > 0 ? suppliers : undefined,
+        invoices: invoices.length > 0 ? invoices : undefined,
+        purchases: purchases.length > 0 ? purchases : undefined,
+        stockMovements: stockMovements.length > 0 ? stockMovements : undefined,
+        payments: payments.length > 0 ? payments : undefined,
+        expenses: expenses.length > 0 ? expenses : undefined,
         categories,
+        settings,
       },
-      message: `Pulled ${products.length} products and ${customers.length} customers from Firebase Cloud`,
+      message: `Pulled ${products.length} products, ${invoices.length} invoices, and ${customers.length} customers from Firebase Cloud`,
     };
   } catch (error: any) {
     handleFirestoreError(error, OperationType.LIST, 'store_pull');
