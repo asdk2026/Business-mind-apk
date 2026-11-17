@@ -32,6 +32,7 @@ export const FirebaseAuthGate: React.FC = () => {
     cachedOfflineUser,
     hasOfflinePin,
     isSessionLockedOffline,
+    authTimedOutOffline,
     unlockOfflineSession,
   } = useApp();
 
@@ -111,7 +112,9 @@ export const FirebaseAuthGate: React.FC = () => {
     }
   };
 
-  const showOfflineUnlockCard = Boolean(cachedOfflineUser && (!isOnline || isSessionLockedOffline));
+  const showOfflineUnlockCard = Boolean(
+    cachedOfflineUser && (!isOnline || isSessionLockedOffline || authTimedOutOffline)
+  );
 
   return (
     <div className="min-h-screen w-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4 relative overflow-y-auto">

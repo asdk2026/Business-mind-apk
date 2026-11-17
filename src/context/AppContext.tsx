@@ -197,6 +197,7 @@ interface AppContextType {
   cachedOfflineUser: UserAccount | null;
   hasOfflinePin: boolean;
   isSessionLockedOffline: boolean;
+  authTimedOutOffline: boolean;
   unlockOfflineSession: (pin?: string) => Promise<{ success: boolean; error?: string }>;
   setOfflinePin: (pin: string) => Promise<{ success: boolean; error?: string }>;
   removeOfflinePin: () => void;
@@ -254,22 +255,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     getLocal<SyncLog[]>(STORAGE_KEYS.SYNC_LOGS, INITIAL_SYNC_LOGS)
   );
 
+  // Offline Cached Session & PIN Security (Synchronous boot check)
+  const initialCachedUser = useMemo(() => getAnyCachedAuthUser(), []);
+  const initialHasPin = useMemo(
+    () => (initialCachedUser ? hasOfflineUnlockPin(initialCachedUser.uid) : hasOfflineUnlockPin()),
+    [initialCachedUser]
+  );
+  const initialIsOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+
   // Firebase Auth & RBAC state
-  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  // When already offline on boot, NEVER block on Firebase network verification!
+  const [authLoading, setAuthLoading] = useState<boolean>(() => !initialIsOffline);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() =>
+    initialIsOffline && initialCachedUser && !initialHasPin ? initialCachedUser : null
+  );
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [showLoginModal, setShowLoginModal] = useState(false);
 
-  // Offline Cached Session & PIN Security
-  const [cachedOfflineUser, setCachedOfflineUser] = useState<UserAccount | null>(() =>
-    getAnyCachedAuthUser()
-  );
+  const [cachedOfflineUser, setCachedOfflineUser] = useState<UserAccount | null>(initialCachedUser);
   const [isSessionLockedOffline, setIsSessionLockedOffline] = useState<boolean>(false);
-  const [hasOfflinePin, setHasOfflinePin] = useState<boolean>(() => {
-    const cached = getAnyCachedAuthUser();
-    return cached ? hasOfflineUnlockPin(cached.uid) : hasOfflineUnlockPin();
-  });
+  const [authTimedOutOffline, setAuthTimedOutOffline] = useState<boolean>(false);
+  const [hasOfflinePin, setHasOfflinePin] = useState<boolean>(initialHasPin);
+  const unlockedViaOfflineRef = useRef<boolean>(
+    Boolean(initialIsOffline && initialCachedUser && !initialHasPin)
+  );
 
   // SQLite Engine Diagnostics, Rolling Snapshots & Conflict Log
   const [sqliteStats, setSqliteStats] = useState<SqliteStats>(() => getSqliteStats());
@@ -329,18 +339,45 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const clearAuthError = useCallback(() => setAuthError(null), []);
 
-  // Test Firestore connection on mount
+  // Test Firestore connection on mount only when online
   useEffect(() => {
-    testFirestoreConnection();
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      testFirestoreConnection();
+    }
     refreshSqliteDiagnostics();
   }, [refreshSqliteDiagnostics]);
 
-  // Listen to Firebase Auth + Real-Time Firestore Profile
+  // Listen to Firebase Auth + Real-Time Firestore Profile with offline instant unlock & watchdog
   useEffect(() => {
     const auth = getFirebaseAuth();
     let unsubscribeProfile: (() => void) | null = null;
+    let authSettled = false;
+
+    // Watchdog: never get stuck on "Verifying Firebase session & access permissions..."
+    // when offline, on airplane mode, or on dead Wi-Fi inside WebView.
+    const watchdogTimer = setTimeout(() => {
+      if (authSettled) return;
+      const fallbackUser = getAnyCachedAuthUser();
+      if (fallbackUser) {
+        const hasPin = hasOfflineUnlockPin(fallbackUser.uid);
+        setCachedOfflineUser(fallbackUser);
+        setHasOfflinePin(hasPin);
+        if (!hasPin) {
+          unlockedViaOfflineRef.current = true;
+          setCurrentUser((prev) => prev || fallbackUser);
+        } else {
+          setAuthTimedOutOffline(true);
+        }
+      } else {
+        setAuthTimedOutOffline(true);
+      }
+      setAuthLoading(false);
+    }, 2200);
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (fbUser) => {
+      authSettled = true;
+      clearTimeout(watchdogTimer);
+
       if (unsubscribeProfile) {
         unsubscribeProfile();
         unsubscribeProfile = null;
@@ -348,8 +385,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (!fbUser) {
         setCurrentUser((prev) => {
-          // If offline and user already unlocked via cached session, keep active session
-          if (typeof navigator !== 'undefined' && !navigator.onLine && prev) {
+          // Keep unlocked cached session if offline or manually unlocked offline
+          if (prev && ((typeof navigator !== 'undefined' && !navigator.onLine) || unlockedViaOfflineRef.current)) {
             return prev;
           }
           return null;
@@ -360,9 +397,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return;
       }
 
-      setAuthLoading(true);
+      // If we have cached authorization for this user & no PIN lock, unblock UI immediately!
+      const cachedSameUser = getAnyCachedAuthUser();
+      if (cachedSameUser && cachedSameUser.uid === fbUser.uid) {
+        const hasPin = hasOfflineUnlockPin(cachedSameUser.uid);
+        setCachedOfflineUser(cachedSameUser);
+        setHasOfflinePin(hasPin);
+        if (!hasPin) {
+          setCurrentUser((prev) => prev || cachedSameUser);
+          setAuthLoading(false);
+        }
+      }
+
       try {
         const resolved = await resolveAuthorizedUserProfile(fbUser);
+        unlockedViaOfflineRef.current = false;
+        setAuthTimedOutOffline(false);
         setCurrentUser(resolved);
         setCachedOfflineUser(resolved);
         setHasOfflinePin(hasOfflineUnlockPin(resolved.uid));
@@ -391,14 +441,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
         );
       } catch (err: any) {
-        setCurrentUser(null);
-        setAuthError(err?.message || 'Access Denied. Only Admin can create accounts.');
+        if (
+          cachedSameUser &&
+          cachedSameUser.uid === fbUser.uid &&
+          typeof navigator !== 'undefined' &&
+          !navigator.onLine
+        ) {
+          setCurrentUser(cachedSameUser);
+        } else {
+          setCurrentUser(null);
+          setAuthError(err?.message || 'Access Denied. Only Admin can create accounts.');
+        }
       } finally {
         setAuthLoading(false);
       }
     });
 
     return () => {
+      clearTimeout(watchdogTimer);
       if (unsubscribeProfile) unsubscribeProfile();
       unsubscribeAuth();
     };
@@ -1796,6 +1856,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return { success: false, error: 'Incorrect Offline PIN. Please try again.' };
         }
       }
+      unlockedViaOfflineRef.current = true;
+      setAuthTimedOutOffline(false);
       setCurrentUser(cached);
       setCachedOfflineUser(cached);
       setIsSessionLockedOffline(false);
@@ -1833,6 +1895,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   const logout = useCallback(async () => {
+    unlockedViaOfflineRef.current = false;
+    setAuthTimedOutOffline(false);
     await signOutFirebase();
     setCurrentUser(null);
     setCachedOfflineUser(null);
@@ -2451,6 +2515,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       cachedOfflineUser,
       hasOfflinePin,
       isSessionLockedOffline,
+      authTimedOutOffline,
       unlockOfflineSession,
       setOfflinePin,
       removeOfflinePin,
@@ -2534,6 +2599,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       cachedOfflineUser,
       hasOfflinePin,
       isSessionLockedOffline,
+      authTimedOutOffline,
       unlockOfflineSession,
       setOfflinePin,
       removeOfflinePin,

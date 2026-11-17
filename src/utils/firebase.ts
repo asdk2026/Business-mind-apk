@@ -268,8 +268,16 @@ export async function resolveAuthorizedUserProfile(fbUser: FirebaseUser): Promis
   const userEmail = (fbUser.email || '').toLowerCase().trim();
   const userRef = doc(db, 'users', fbUser.uid);
 
+  const fetchDocWithTimeout = <T,>(promise: Promise<T>, ms = 3500): Promise<T> =>
+    Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error('network_timeout_offline_fallback')), ms)
+      ),
+    ]);
+
   try {
-    const snap = await getDoc(userRef);
+    const snap = await fetchDocWithTimeout(getDoc(userRef), cached ? 2500 : 4500);
     if (snap.exists()) {
       const data = snap.data() as UserAccount;
       const normalized: UserAccount = {
@@ -285,7 +293,7 @@ export async function resolveAuthorizedUserProfile(fbUser: FirebaseUser): Promis
       }
       setCachedAuthUser(normalized);
       if (typeof navigator === 'undefined' || navigator.onLine) {
-        await updateDoc(userRef, {
+        updateDoc(userRef, {
           last_login: new Date().toISOString(),
         }).catch(() => {});
       }
@@ -363,7 +371,10 @@ export async function resolveAuthorizedUserProfile(fbUser: FirebaseUser): Promis
       'Access Denied: Public registration is disabled. Only an Admin can create or authorize accounts.'
     );
   } catch (err: any) {
-    if (cached && isOfflineOrNetworkError(err)) {
+    if (
+      cached &&
+      (isOfflineOrNetworkError(err) || err?.message === 'network_timeout_offline_fallback')
+    ) {
       return cached;
     }
     throw err;
