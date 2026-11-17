@@ -28,6 +28,7 @@ function AppContent() {
   const {
     authLoading,
     currentUser,
+    isSessionLockedOffline,
     isAdmin,
     hasModuleAccess,
     hasActionPermission,
@@ -51,7 +52,7 @@ function AppContent() {
     );
   }
 
-  if (!currentUser) {
+  if (!currentUser || isSessionLockedOffline) {
     return <FirebaseAuthGate />;
   }
 

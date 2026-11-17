@@ -10,6 +10,12 @@ import {
   BusinessSettings,
   SyncLog,
 } from '../types';
+import {
+  isSqliteReady,
+  replaceCollectionInSqlite,
+  setKvInSqlite,
+  SqliteCollectionName,
+} from './sqlite';
 
 const STORAGE_KEYS = {
   PRODUCTS: 'bm_products_v1',
@@ -679,11 +685,30 @@ export function getLocal<T>(key: string, defaultValue: T): T {
   }
 }
 
+const KEY_TO_SQLITE_TABLE: Record<string, SqliteCollectionName> = {
+  [STORAGE_KEYS.PRODUCTS]: 'products',
+  [STORAGE_KEYS.CUSTOMERS]: 'customers',
+  [STORAGE_KEYS.SUPPLIERS]: 'suppliers',
+  [STORAGE_KEYS.INVOICES]: 'invoices',
+  [STORAGE_KEYS.PURCHASES]: 'purchases',
+  [STORAGE_KEYS.STOCK_MOVEMENTS]: 'stock_movements',
+  [STORAGE_KEYS.PAYMENTS]: 'payments',
+  [STORAGE_KEYS.EXPENSES]: 'expenses',
+};
+
 export function setLocal<T>(key: string, value: T): void {
   try {
     const serialized = JSON.stringify(value);
     localStorage.setItem(key, serialized);
     mirrorToIndexedDB(key, serialized);
+    if (isSqliteReady()) {
+      const table = KEY_TO_SQLITE_TABLE[key];
+      if (table && Array.isArray(value)) {
+        replaceCollectionInSqlite(table, value);
+      } else {
+        setKvInSqlite(key, serialized);
+      }
+    }
   } catch (err) {
     console.error('Local storage write failure:', err);
   }
@@ -697,6 +722,9 @@ export function markUserHasRealData(): void {
   try {
     localStorage.setItem(STORAGE_KEYS.HAS_USER_DATA, 'true');
     mirrorToIndexedDB(STORAGE_KEYS.HAS_USER_DATA, 'true');
+    if (isSqliteReady()) {
+      setKvInSqlite(STORAGE_KEYS.HAS_USER_DATA, 'true');
+    }
   } catch {
     // ignore
   }
@@ -711,6 +739,9 @@ export function setPendingCloudSync(pending: boolean): void {
     const val = pending ? 'true' : 'false';
     localStorage.setItem(STORAGE_KEYS.PENDING_CLOUD_SYNC, val);
     mirrorToIndexedDB(STORAGE_KEYS.PENDING_CLOUD_SYNC, val);
+    if (isSqliteReady()) {
+      setKvInSqlite(STORAGE_KEYS.PENDING_CLOUD_SYNC, val);
+    }
   } catch {
     // ignore
   }

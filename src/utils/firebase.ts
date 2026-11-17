@@ -44,6 +44,8 @@ import {
   UserAccount,
   FirebaseUserRole,
   UserPermissions,
+  SyncQueueItem,
+  ConflictRecord,
 } from '../types';
 import {
   ROOT_ADMIN_EMAIL,
@@ -172,6 +174,10 @@ export function getCachedAuthUser(uid?: string): UserAccount | null {
     ...cached,
     permissions: normalizePermissions(cached.role, cached.permissions),
   };
+}
+
+export function getAnyCachedAuthUser(): UserAccount | null {
+  return getCachedAuthUser(undefined);
 }
 
 export function setCachedAuthUser(user: UserAccount | null): void {
@@ -636,6 +642,127 @@ async function commitOperationsInChunks(db: Firestore, ops: BatchOp[]): Promise<
       }
     }
     await batch.commit();
+  }
+}
+
+/**
+ * Conflict Handler: Compares Record Version first, then Last Updated ISO timestamp.
+ */
+export function resolveRecordConflict<
+  T extends {
+    id: string;
+    version?: number;
+    updated_at?: string;
+    created_at?: string;
+    date?: string;
+    timestamp?: string;
+  }
+>(
+  collectionName: string,
+  localItem: T,
+  cloudItem: T
+): { chosen: T; conflict?: ConflictRecord } {
+  const localVersion = Number(localItem.version) || 1;
+  const cloudVersion = Number(cloudItem.version) || 1;
+
+  const localUpdatedAt =
+    localItem.updated_at || localItem.created_at || localItem.date || localItem.timestamp || '';
+  const cloudUpdatedAt =
+    cloudItem.updated_at || cloudItem.created_at || cloudItem.date || cloudItem.timestamp || '';
+
+  const localTs = Date.parse(localUpdatedAt) || 0;
+  const cloudTs = Date.parse(cloudUpdatedAt) || 0;
+
+  let winner: 'local' | 'cloud' = 'local';
+  if (cloudVersion > localVersion) {
+    winner = 'cloud';
+  } else if (cloudVersion === localVersion && cloudTs > localTs) {
+    winner = 'cloud';
+  }
+
+  const chosen = winner === 'cloud' ? cloudItem : localItem;
+
+  // Detect real divergence if timestamps/versions differ and serialized payloads aren't identical
+  const localStr = JSON.stringify({ ...localItem, version: undefined, updated_at: undefined });
+  const cloudStr = JSON.stringify({ ...cloudItem, version: undefined, updated_at: undefined });
+  if ((localVersion !== cloudVersion || localTs !== cloudTs) && localStr !== cloudStr) {
+    return {
+      chosen,
+      conflict: {
+        id: `conf_${collectionName}_${localItem.id}_${Date.now()}`,
+        collection: collectionName,
+        docId: localItem.id,
+        localVersion,
+        cloudVersion,
+        localUpdatedAt,
+        cloudUpdatedAt,
+        winner,
+        resolvedAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  return { chosen };
+}
+
+/**
+ * Flush queued background sync operations stored in SQLite sync_queue to Firestore
+ */
+export async function flushSyncQueueToFirebase(
+  queue: SyncQueueItem[]
+): Promise<{ success: boolean; processedIds: string[]; error?: string }> {
+  if (queue.length === 0) {
+    return { success: true, processedIds: [] };
+  }
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return { success: false, processedIds: [], error: 'Offline' };
+  }
+
+  try {
+    const db = getFirebaseFirestore();
+    const ops: BatchOp[] = [];
+    const processedIds: string[] = [];
+
+    for (const item of queue) {
+      if (item.op_type === 'delete') {
+        ops.push({
+          type: 'delete',
+          collectionName: item.collection_name,
+          docId: item.doc_id,
+        });
+        processedIds.push(item.op_id);
+      } else if (item.payload_json) {
+        try {
+          const parsed = JSON.parse(item.payload_json);
+          ops.push({
+            type: 'set',
+            collectionName: item.collection_name,
+            docId: item.doc_id,
+            data: {
+              ...parsed,
+              version: item.version || parsed.version || 1,
+              updated_at: item.updated_at || parsed.updated_at || new Date().toISOString(),
+            },
+          });
+          processedIds.push(item.op_id);
+        } catch {
+          // Skip unparseable payload cleanly
+          processedIds.push(item.op_id);
+        }
+      }
+    }
+
+    if (ops.length > 0) {
+      await commitOperationsInChunks(db, ops);
+    }
+    return { success: true, processedIds };
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.WRITE, 'sync_queue_flush');
+    return {
+      success: false,
+      processedIds: [],
+      error: err?.message || 'Queue sync failed',
+    };
   }
 }
 

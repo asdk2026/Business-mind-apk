@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Product, ProductQuality, ProductVariant } from '../../types';
+import { CachedImage } from '../common/CachedImage';
 
 interface BarcodeScannerViewProps {
   onAddProductToInvoice?: (
@@ -280,15 +281,12 @@ export const BarcodeScannerView: React.FC<BarcodeScannerViewProps> = ({
                 <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700/80 space-y-3">
                   <div className="flex gap-3">
                     <div className="w-16 h-16 rounded-lg bg-slate-900 border border-slate-700 overflow-hidden flex items-center justify-center shrink-0">
-                      {foundMatch.product.image_url ? (
-                        <img
-                          src={foundMatch.product.image_url}
-                          alt={foundMatch.product.name}
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <Package className="w-7 h-7 text-slate-500" />
-                      )}
+                      <CachedImage
+                        src={foundMatch.product.image_url}
+                        alt={foundMatch.product.name}
+                        className="w-full h-full object-cover"
+                        fallbackIconClassName="w-7 h-7 text-slate-500"
+                      />
                     </div>
                     <div className="flex-1 min-w-0">
                       <span className="text-[10px] text-emerald-400 font-mono">

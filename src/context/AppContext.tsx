@@ -16,6 +16,9 @@ import {
   FirebaseUserRole,
   UserPermissions,
   ActionPermissions,
+  ConflictRecord,
+  DatabaseSnapshotMeta,
+  SqliteStats,
 } from '../types';
 import {
   STORAGE_KEYS,
@@ -53,7 +56,30 @@ import {
   subscribeToAllUsers,
   syncStoreToFirebase,
   fetchStoreFromFirebase,
+  getAnyCachedAuthUser,
+  resolveRecordConflict,
+  flushSyncQueueToFirebase,
 } from '../utils/firebase';
+import {
+  enqueueSyncOperation,
+  getPendingSyncQueue,
+  removeSyncQueueItems,
+  markSyncQueueAttemptError,
+  createDatabaseSnapshot,
+  listDatabaseSnapshots,
+  getSnapshotPayloadById,
+  exportSqliteBinary,
+  importSqliteBinary,
+  getSqliteStats,
+  recordConflictsToSqlite,
+  getRecentConflictsFromSqlite,
+  hasOfflineUnlockPin,
+  setOfflineUnlockPin,
+  clearOfflineUnlockPin,
+  verifyOfflineUnlockPin,
+  scheduleSqlitePersist,
+} from '../utils/sqlite';
+import { warmImageCache } from '../utils/imageCache';
 import { translations, Language } from '../utils/i18n';
 
 interface NotificationItem {
@@ -166,6 +192,25 @@ interface AppContextType {
   syncToFirebase: () => Promise<boolean>;
   syncFromFirebase: () => Promise<boolean>;
   lastFirebaseSync: string | null;
+
+  // Offline Security & PIN Unlock
+  cachedOfflineUser: UserAccount | null;
+  hasOfflinePin: boolean;
+  isSessionLockedOffline: boolean;
+  unlockOfflineSession: (pin?: string) => Promise<{ success: boolean; error?: string }>;
+  setOfflinePin: (pin: string) => Promise<{ success: boolean; error?: string }>;
+  removeOfflinePin: () => void;
+  lockSessionOffline: () => void;
+
+  // SQLite Engine, Rolling Snapshots, Conflict Log & Data Recovery
+  sqliteStats: SqliteStats;
+  snapshots: DatabaseSnapshotMeta[];
+  conflicts: ConflictRecord[];
+  createManualSnapshot: () => DatabaseSnapshotMeta | null;
+  restoreFromSnapshot: (snapshotId: string) => boolean;
+  exportSqliteFile: () => Uint8Array | null;
+  importSqliteFile: (bytes: Uint8Array) => Promise<boolean>;
+  refreshSqliteDiagnostics: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -216,6 +261,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [showLoginModal, setShowLoginModal] = useState(false);
 
+  // Offline Cached Session & PIN Security
+  const [cachedOfflineUser, setCachedOfflineUser] = useState<UserAccount | null>(() =>
+    getAnyCachedAuthUser()
+  );
+  const [isSessionLockedOffline, setIsSessionLockedOffline] = useState<boolean>(false);
+  const [hasOfflinePin, setHasOfflinePin] = useState<boolean>(() => {
+    const cached = getAnyCachedAuthUser();
+    return cached ? hasOfflineUnlockPin(cached.uid) : hasOfflineUnlockPin();
+  });
+
+  // SQLite Engine Diagnostics, Rolling Snapshots & Conflict Log
+  const [sqliteStats, setSqliteStats] = useState<SqliteStats>(() => getSqliteStats());
+  const [snapshots, setSnapshots] = useState<DatabaseSnapshotMeta[]>(() => listDatabaseSnapshots());
+  const [conflicts, setConflicts] = useState<ConflictRecord[]>(() => getRecentConflictsFromSqlite());
+
+  const refreshSqliteDiagnostics = useCallback(() => {
+    setSqliteStats(getSqliteStats());
+    setSnapshots(listDatabaseSnapshots());
+    setConflicts(getRecentConflictsFromSqlite());
+  }, []);
+
+  const registerBackgroundSyncTag = useCallback(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.ready
+      .then((reg: any) => {
+        if (reg && reg.sync && typeof reg.sync.register === 'function') {
+          reg.sync.register('bm-cloud-sync').catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   const [categories, setCategories] = useState<string[]>(() =>
     getLocal<string[]>(STORAGE_KEYS.CATEGORIES, INITIAL_CATEGORIES)
   );
@@ -238,7 +315,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [notifications, setNotifications] = useState<NotificationItem[]>([
     {
       id: 'notif_1',
-      title: 'Welcome to Business Mind! Firebase Cloud RBAC & Offline database active.',
+      title: 'Business Mind Offline-First SQLite Engine & Cloud RBAC active.',
       time: 'Just now',
       type: 'info',
     },
@@ -255,7 +332,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Test Firestore connection on mount
   useEffect(() => {
     testFirestoreConnection();
-  }, []);
+    refreshSqliteDiagnostics();
+  }, [refreshSqliteDiagnostics]);
 
   // Listen to Firebase Auth + Real-Time Firestore Profile
   useEffect(() => {
@@ -269,7 +347,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       if (!fbUser) {
-        setCurrentUser(null);
+        setCurrentUser((prev) => {
+          // If offline and user already unlocked via cached session, keep active session
+          if (typeof navigator !== 'undefined' && !navigator.onLine && prev) {
+            return prev;
+          }
+          return null;
+        });
+        setCachedOfflineUser(getAnyCachedAuthUser());
         setUsers([]);
         setAuthLoading(false);
         return;
@@ -279,6 +364,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       try {
         const resolved = await resolveAuthorizedUserProfile(fbUser);
         setCurrentUser(resolved);
+        setCachedOfflineUser(resolved);
+        setHasOfflinePin(hasOfflineUnlockPin(resolved.uid));
         setAuthError(null);
 
         // Live listener on current user's profile so permission/role/active changes apply immediately
@@ -442,70 +529,99 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   }, []);
 
-  const updateSettings = useCallback((newSettings: Partial<BusinessSettings>) => {
-    setSettings((prev) => {
-      const updated = { ...prev, ...newSettings };
-      setLocal(STORAGE_KEYS.SETTINGS, updated);
-      markUserHasRealData();
-      setPendingCloudSync(true);
-      return updated;
-    });
-  }, []);
+  const updateSettings = useCallback(
+    (newSettings: Partial<BusinessSettings>) => {
+      const now = new Date().toISOString();
+      setSettings((prev) => {
+        const updated: BusinessSettings = {
+          ...prev,
+          ...newSettings,
+          version: (prev.version || 1) + 1,
+          updated_at: now,
+        };
+        setLocal(STORAGE_KEYS.SETTINGS, updated);
+        markUserHasRealData();
+        setPendingCloudSync(true);
+        enqueueSyncOperation({
+          collection_name: 'system',
+          doc_id: 'business_settings',
+          op_type: 'upsert',
+          payload: updated,
+          version: updated.version,
+          updated_at: now,
+        });
+        registerBackgroundSyncTag();
+        return updated;
+      });
+      refreshSqliteDiagnostics();
+    },
+    [refreshSqliteDiagnostics, registerBackgroundSyncTag]
+  );
 
   const dismissNotification = useCallback((id: string) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));
   }, []);
 
-  const triggerSyncNow = useCallback(async () => {
-    setSyncStatus('syncing');
-    await new Promise((res) => setTimeout(res, 900));
-    const nowIso = new Date().toISOString();
-    const newLog: SyncLog = {
-      id: `sync_${Date.now()}`,
-      timestamp: nowIso,
-      action: 'Cloud & Multi-Device Sync',
-      status: 'synced',
-      details: `Successfully synchronized ${products.length} products, ${invoices.length} invoices, and ${customers.length} customers with cloud.`,
-    };
-    const updatedLogs = [newLog, ...syncLogs].slice(0, 30);
-    setSyncLogs(updatedLogs);
-    setLocal(STORAGE_KEYS.SYNC_LOGS, updatedLogs);
-    updateSettings({ last_sync_time: nowIso });
-    setSyncStatus('synced');
-  }, [products.length, invoices.length, customers.length, syncLogs, updateSettings]);
-
   // Products CRUD
   const addProduct = useCallback(
     (data: Omit<Product, 'id' | 'created_at' | 'updated_at'>): Product => {
+      const now = new Date().toISOString();
       const newProduct: Product = {
         ...data,
         id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: now,
+        updated_at: now,
+        version: 1,
       };
       const updated = [newProduct, ...products];
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
       markUserHasRealData();
       setPendingCloudSync(true);
+      enqueueSyncOperation({
+        collection_name: 'products',
+        doc_id: newProduct.id,
+        op_type: 'upsert',
+        payload: newProduct,
+        version: 1,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setSyncStatus('pending');
       return newProduct;
     },
-    [products]
+    [products, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const updateProduct = useCallback(
     (product: Product) => {
-      const updated = products.map((p) =>
-        p.id === product.id ? { ...product, updated_at: new Date().toISOString() } : p
-      );
+      const now = new Date().toISOString();
+      const existing = products.find((p) => p.id === product.id);
+      const nextVersion = Math.max(product.version || 0, existing?.version || 1) + 1;
+      const versioned: Product = {
+        ...product,
+        updated_at: now,
+        version: nextVersion,
+      };
+      const updated = products.map((p) => (p.id === product.id ? versioned : p));
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
       markUserHasRealData();
       setPendingCloudSync(true);
+      enqueueSyncOperation({
+        collection_name: 'products',
+        doc_id: versioned.id,
+        op_type: 'upsert',
+        payload: versioned,
+        version: nextVersion,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setSyncStatus('pending');
     },
-    [products]
+    [products, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const deleteProduct = useCallback(
@@ -515,67 +631,118 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
       markUserHasRealData();
       queueCloudDeletion('products', id);
+      enqueueSyncOperation({
+        collection_name: 'products',
+        doc_id: id,
+        op_type: 'delete',
+        updated_at: new Date().toISOString(),
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [products]
+    [products, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const duplicateProduct = useCallback(
     (id: string) => {
       const found = products.find((p) => p.id === id);
       if (!found) return;
+      const now = new Date().toISOString();
       const duplicated: Product = {
         ...found,
         id: `prod_${Date.now()}_copy`,
         name: `${found.name} (Copy)`,
         code: `${found.code}-COPY`,
         barcode: `${found.barcode ? found.barcode + '9' : ''}`,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: now,
+        updated_at: now,
+        version: 1,
       };
       const updated = [duplicated, ...products];
       setProducts(updated);
       setLocal(STORAGE_KEYS.PRODUCTS, updated);
       markUserHasRealData();
+      enqueueSyncOperation({
+        collection_name: 'products',
+        doc_id: duplicated.id,
+        op_type: 'upsert',
+        payload: duplicated,
+        version: 1,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [products]
+    [products, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // Customers CRUD
   const addCustomer = useCallback(
     (data: Omit<Customer, 'id' | 'created_at' | 'total_purchases' | 'total_paid' | 'outstanding_due'>): Customer => {
+      const now = new Date().toISOString();
       const newCust: Customer = {
         ...data,
         id: `cust_${Date.now()}`,
         total_purchases: 0,
         total_paid: 0,
         outstanding_due: data.opening_balance || 0,
-        created_at: new Date().toISOString(),
+        created_at: now,
+        updated_at: now,
+        version: 1,
       };
       const updated = [newCust, ...customers];
       setCustomers(updated);
       setLocal(STORAGE_KEYS.CUSTOMERS, updated);
       markUserHasRealData();
+      enqueueSyncOperation({
+        collection_name: 'customers',
+        doc_id: newCust.id,
+        op_type: 'upsert',
+        payload: newCust,
+        version: 1,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
       return newCust;
     },
-    [customers]
+    [customers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const updateCustomer = useCallback(
     (cust: Customer) => {
-      const updated = customers.map((c) => (c.id === cust.id ? cust : c));
+      const now = new Date().toISOString();
+      const existing = customers.find((c) => c.id === cust.id);
+      const nextVersion = Math.max(cust.version || 0, existing?.version || 1) + 1;
+      const versioned: Customer = {
+        ...cust,
+        updated_at: now,
+        version: nextVersion,
+      };
+      const updated = customers.map((c) => (c.id === cust.id ? versioned : c));
       setCustomers(updated);
       setLocal(STORAGE_KEYS.CUSTOMERS, updated);
       markUserHasRealData();
+      enqueueSyncOperation({
+        collection_name: 'customers',
+        doc_id: versioned.id,
+        op_type: 'upsert',
+        payload: versioned,
+        version: nextVersion,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [customers]
+    [customers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const deleteCustomer = useCallback(
@@ -585,10 +752,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setLocal(STORAGE_KEYS.CUSTOMERS, updated);
       markUserHasRealData();
       queueCloudDeletion('customers', id);
+      enqueueSyncOperation({
+        collection_name: 'customers',
+        doc_id: id,
+        op_type: 'delete',
+        updated_at: new Date().toISOString(),
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [customers]
+    [customers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const receiveCustomerPayment = useCallback(
@@ -602,14 +777,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const cust = customers.find((c) => c.id === customerId);
       if (!cust || amount <= 0) return;
 
+      const now = new Date().toISOString();
+      const nextCustVersion = (cust.version || 1) + 1;
       const updatedCust: Customer = {
         ...cust,
         total_paid: cust.total_paid + amount,
         outstanding_due: Math.max(0, cust.outstanding_due - amount),
+        updated_at: now,
+        version: nextCustVersion,
       };
       const updatedCustomers = customers.map((c) => (c.id === cust.id ? updatedCust : c));
       setCustomers(updatedCustomers);
       setLocal(STORAGE_KEYS.CUSTOMERS, updatedCustomers);
+      enqueueSyncOperation({
+        collection_name: 'customers',
+        doc_id: updatedCust.id,
+        op_type: 'upsert',
+        payload: updatedCust,
+        version: nextCustVersion,
+        updated_at: now,
+      });
 
       const newPayment: PaymentRecord = {
         id: `pay_${Date.now()}`,
@@ -620,74 +807,124 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         party_phone: cust.phone,
         reference_id: invoiceId,
         amount,
-        payment_date: new Date().toISOString(),
+        payment_date: now,
         payment_method: paymentMethod,
         notes,
+        updated_at: now,
+        version: 1,
       };
       const updatedPayments = [newPayment, ...payments];
       setPayments(updatedPayments);
       setLocal(STORAGE_KEYS.PAYMENTS, updatedPayments);
+      enqueueSyncOperation({
+        collection_name: 'payments',
+        doc_id: newPayment.id,
+        op_type: 'upsert',
+        payload: newPayment,
+        version: 1,
+        updated_at: now,
+      });
 
       if (invoiceId) {
         const inv = invoices.find((i) => i.id === invoiceId);
         if (inv) {
           const newPaid = inv.paid_amount + amount;
           const newDue = Math.max(0, inv.grand_total - newPaid);
-          const updatedInvoices = invoices.map((i) =>
-            i.id === invoiceId
-              ? {
-                  ...i,
-                  paid_amount: newPaid,
-                  due_amount: newDue,
-                  payment_status: (newDue === 0 ? 'paid' : 'partial') as 'paid' | 'partial',
-                  updated_at: new Date().toISOString(),
-                }
-              : i
-          );
+          const nextInvVersion = (inv.version || 1) + 1;
+          const updatedInv: Invoice = {
+            ...inv,
+            paid_amount: newPaid,
+            due_amount: newDue,
+            payment_status: (newDue === 0 ? 'paid' : 'partial') as 'paid' | 'partial',
+            updated_at: now,
+            version: nextInvVersion,
+          };
+          const updatedInvoices = invoices.map((i) => (i.id === invoiceId ? updatedInv : i));
           setInvoices(updatedInvoices);
           setLocal(STORAGE_KEYS.INVOICES, updatedInvoices);
+          enqueueSyncOperation({
+            collection_name: 'invoices',
+            doc_id: updatedInv.id,
+            op_type: 'upsert',
+            payload: updatedInv,
+            version: nextInvVersion,
+            updated_at: now,
+          });
         }
       }
 
       markUserHasRealData();
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [customers, payments, invoices, settings.business_id]
+    [customers, payments, invoices, settings.business_id, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // Suppliers CRUD
   const addSupplier = useCallback(
     (data: Omit<Supplier, 'id' | 'created_at' | 'total_purchased' | 'total_paid' | 'outstanding_due'>): Supplier => {
+      const now = new Date().toISOString();
       const newSupp: Supplier = {
         ...data,
         id: `supp_${Date.now()}`,
         total_purchased: 0,
         total_paid: 0,
         outstanding_due: 0,
-        created_at: new Date().toISOString(),
+        created_at: now,
+        updated_at: now,
+        version: 1,
       };
       const updated = [newSupp, ...suppliers];
       setSuppliers(updated);
       setLocal(STORAGE_KEYS.SUPPLIERS, updated);
       markUserHasRealData();
+      enqueueSyncOperation({
+        collection_name: 'suppliers',
+        doc_id: newSupp.id,
+        op_type: 'upsert',
+        payload: newSupp,
+        version: 1,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
       return newSupp;
     },
-    [suppliers]
+    [suppliers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const updateSupplier = useCallback(
     (supp: Supplier) => {
-      const updated = suppliers.map((s) => (s.id === supp.id ? supp : s));
+      const now = new Date().toISOString();
+      const existing = suppliers.find((s) => s.id === supp.id);
+      const nextVersion = Math.max(supp.version || 0, existing?.version || 1) + 1;
+      const versioned: Supplier = {
+        ...supp,
+        updated_at: now,
+        version: nextVersion,
+      };
+      const updated = suppliers.map((s) => (s.id === supp.id ? versioned : s));
       setSuppliers(updated);
       setLocal(STORAGE_KEYS.SUPPLIERS, updated);
       markUserHasRealData();
+      enqueueSyncOperation({
+        collection_name: 'suppliers',
+        doc_id: versioned.id,
+        op_type: 'upsert',
+        payload: versioned,
+        version: nextVersion,
+        updated_at: now,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [suppliers]
+    [suppliers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const recordSupplierPayment = useCallback(
@@ -695,14 +932,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const supp = suppliers.find((s) => s.id === supplierId);
       if (!supp || amount <= 0) return;
 
+      const now = new Date().toISOString();
+      const nextSuppVersion = (supp.version || 1) + 1;
       const updatedSupp: Supplier = {
         ...supp,
         total_paid: supp.total_paid + amount,
         outstanding_due: Math.max(0, supp.outstanding_due - amount),
+        updated_at: now,
+        version: nextSuppVersion,
       };
       const updatedSuppliers = suppliers.map((s) => (s.id === supp.id ? updatedSupp : s));
       setSuppliers(updatedSuppliers);
       setLocal(STORAGE_KEYS.SUPPLIERS, updatedSuppliers);
+      enqueueSyncOperation({
+        collection_name: 'suppliers',
+        doc_id: updatedSupp.id,
+        op_type: 'upsert',
+        payload: updatedSupp,
+        version: nextSuppVersion,
+        updated_at: now,
+      });
 
       const newPayment: PaymentRecord = {
         id: `pay_supp_${Date.now()}`,
@@ -712,24 +961,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         party_name: supp.name,
         party_phone: supp.phone,
         amount,
-        payment_date: new Date().toISOString(),
+        payment_date: now,
         payment_method: paymentMethod,
         notes,
+        updated_at: now,
+        version: 1,
       };
       const updatedPayments = [newPayment, ...payments];
       setPayments(updatedPayments);
       setLocal(STORAGE_KEYS.PAYMENTS, updatedPayments);
+      enqueueSyncOperation({
+        collection_name: 'payments',
+        doc_id: newPayment.id,
+        op_type: 'upsert',
+        payload: newPayment,
+        version: 1,
+        updated_at: now,
+      });
       markUserHasRealData();
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [suppliers, payments, settings.business_id]
+    [suppliers, payments, settings.business_id, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
-  // Invoices & POS
+  // Invoices & POS (100% Offline-First Atomic SQLite + Queue)
   const createInvoice = useCallback(
     (data: Omit<Invoice, 'id' | 'invoice_number' | 'created_at' | 'updated_at'>): Invoice => {
       const now = new Date();
+      const nowIso = now.toISOString();
       const yearMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
       const count = invoices.length + 1;
       const invoiceNumber = `${settings.invoice_prefix || 'BM-'}${yearMonth}-${String(count).padStart(3, '0')}`;
@@ -738,15 +1000,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...data,
         id: `inv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
         invoice_number: invoiceNumber,
-        created_at: now.toISOString(),
-        updated_at: now.toISOString(),
+        created_at: nowIso,
+        updated_at: nowIso,
+        version: 1,
       };
 
       const updatedInvoices = [newInvoice, ...invoices];
       setInvoices(updatedInvoices);
       setLocal(STORAGE_KEYS.INVOICES, updatedInvoices);
+      enqueueSyncOperation({
+        collection_name: 'invoices',
+        doc_id: newInvoice.id,
+        op_type: 'upsert',
+        payload: newInvoice,
+        version: 1,
+        updated_at: nowIso,
+      });
 
       const updatedProducts = [...products];
+      const touchedProductIds = new Set<string>();
       const newMovements: StockMovement[] = [];
 
       for (const item of newInvoice.items) {
@@ -762,8 +1034,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 settings.allow_negative_stock ? -999999 : 0,
                 prev - item.package_quantity
               );
-              newMovements.push({
-                id: `mov_${Date.now()}_${v.id}`,
+              const mov: StockMovement = {
+                id: `mov_${Date.now()}_${v.id}_${Math.random().toString(36).slice(2, 5)}`,
                 business_id: settings.business_id,
                 product_id: prod.id,
                 variant_id: v.id,
@@ -774,16 +1046,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 previous_stock: prev,
                 new_stock: deducted,
                 reference_id: newInvoice.invoice_number,
-                timestamp: now.toISOString(),
+                timestamp: nowIso,
+                updated_at: nowIso,
+                version: 1,
+              };
+              newMovements.push(mov);
+              enqueueSyncOperation({
+                collection_name: 'stock_movements',
+                doc_id: mov.id,
+                op_type: 'upsert',
+                payload: mov,
+                version: 1,
+                updated_at: nowIso,
               });
               return { ...v, stock_quantity: deducted };
             });
             return { ...q, variants };
           });
           prod.qualities = qualities;
+          prod.updated_at = nowIso;
+          prod.version = (prod.version || 1) + 1;
           updatedProducts[prodIndex] = prod;
+          touchedProductIds.add(prod.id);
         }
       }
+
+      touchedProductIds.forEach((pid) => {
+        const prod = updatedProducts.find((p) => p.id === pid);
+        if (prod) {
+          enqueueSyncOperation({
+            collection_name: 'products',
+            doc_id: prod.id,
+            op_type: 'upsert',
+            payload: prod,
+            version: prod.version,
+            updated_at: nowIso,
+          });
+        }
+      });
 
       setProducts(updatedProducts);
       setLocal(STORAGE_KEYS.PRODUCTS, updatedProducts);
@@ -795,14 +1095,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (newInvoice.customer_id) {
         const custIndex = customers.findIndex((c) => c.id === newInvoice.customer_id);
         if (custIndex >= 0) {
-          const cust = { ...customers[custIndex] };
-          cust.total_purchases += newInvoice.grand_total;
-          cust.total_paid += newInvoice.paid_amount;
-          cust.outstanding_due += newInvoice.due_amount;
+          const prevCust = customers[custIndex];
+          const cust: Customer = {
+            ...prevCust,
+            total_purchases: prevCust.total_purchases + newInvoice.grand_total,
+            total_paid: prevCust.total_paid + newInvoice.paid_amount,
+            outstanding_due: prevCust.outstanding_due + newInvoice.due_amount,
+            updated_at: nowIso,
+            version: (prevCust.version || 1) + 1,
+          };
           const updatedCusts = [...customers];
           updatedCusts[custIndex] = cust;
           setCustomers(updatedCusts);
           setLocal(STORAGE_KEYS.CUSTOMERS, updatedCusts);
+          enqueueSyncOperation({
+            collection_name: 'customers',
+            doc_id: cust.id,
+            op_type: 'upsert',
+            payload: cust,
+            version: cust.version,
+            updated_at: nowIso,
+          });
         }
       }
 
@@ -817,21 +1130,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           reference_id: newInvoice.id,
           reference_number: newInvoice.invoice_number,
           amount: newInvoice.paid_amount,
-          payment_date: now.toISOString(),
+          payment_date: nowIso,
           payment_method: newInvoice.payment_method,
           notes: `POS invoice payment for ${newInvoice.invoice_number}`,
+          updated_at: nowIso,
+          version: 1,
         };
         const allPayments = [paymentRecord, ...payments];
         setPayments(allPayments);
         setLocal(STORAGE_KEYS.PAYMENTS, allPayments);
+        enqueueSyncOperation({
+          collection_name: 'payments',
+          doc_id: paymentRecord.id,
+          op_type: 'upsert',
+          payload: paymentRecord,
+          version: 1,
+          updated_at: nowIso,
+        });
       }
 
       markUserHasRealData();
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
       return newInvoice;
     },
-    [invoices, products, settings, stockMovements, customers, payments]
+    [invoices, products, settings, stockMovements, customers, payments, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // Cancel Invoice & return stock
@@ -840,17 +1165,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const inv = invoices.find((i) => i.id === invoiceId);
       if (!inv || inv.payment_status === 'cancelled') return;
 
-      const updatedInvoices = invoices.map((i) =>
-        i.id === invoiceId
-          ? { ...i, payment_status: 'cancelled' as const, updated_at: new Date().toISOString() }
-          : i
-      );
+      const now = new Date().toISOString();
+      const nextInvVersion = (inv.version || 1) + 1;
+      const updatedInv: Invoice = {
+        ...inv,
+        payment_status: 'cancelled' as const,
+        updated_at: now,
+        version: nextInvVersion,
+      };
+      const updatedInvoices = invoices.map((i) => (i.id === invoiceId ? updatedInv : i));
       setInvoices(updatedInvoices);
       setLocal(STORAGE_KEYS.INVOICES, updatedInvoices);
+      enqueueSyncOperation({
+        collection_name: 'invoices',
+        doc_id: updatedInv.id,
+        op_type: 'upsert',
+        payload: updatedInv,
+        version: nextInvVersion,
+        updated_at: now,
+      });
 
       const updatedProducts = [...products];
+      const touchedProductIds = new Set<string>();
       const newMovements: StockMovement[] = [];
-      const now = new Date().toISOString();
 
       for (const item of inv.items) {
         const prodIndex = updatedProducts.findIndex((p) => p.id === item.product_id);
@@ -862,8 +1199,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               if (v.id !== item.variant_id) return v;
               const prev = v.stock_quantity;
               const restored = prev + item.package_quantity;
-              newMovements.push({
-                id: `mov_ret_${Date.now()}_${v.id}`,
+              const mov: StockMovement = {
+                id: `mov_ret_${Date.now()}_${v.id}_${Math.random().toString(36).slice(2, 5)}`,
                 business_id: settings.business_id,
                 product_id: prod.id,
                 variant_id: v.id,
@@ -875,14 +1212,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 new_stock: restored,
                 reference_id: inv.invoice_number,
                 timestamp: now,
+                updated_at: now,
+                version: 1,
+              };
+              newMovements.push(mov);
+              enqueueSyncOperation({
+                collection_name: 'stock_movements',
+                doc_id: mov.id,
+                op_type: 'upsert',
+                payload: mov,
+                version: 1,
+                updated_at: now,
               });
               return { ...v, stock_quantity: restored };
             });
             return { ...q, variants };
           });
+          prod.updated_at = now;
+          prod.version = (prod.version || 1) + 1;
           updatedProducts[prodIndex] = prod;
+          touchedProductIds.add(prod.id);
         }
       }
+
+      touchedProductIds.forEach((pid) => {
+        const prod = updatedProducts.find((p) => p.id === pid);
+        if (prod) {
+          enqueueSyncOperation({
+            collection_name: 'products',
+            doc_id: prod.id,
+            op_type: 'upsert',
+            payload: prod,
+            version: prod.version,
+            updated_at: now,
+          });
+        }
+      });
 
       setProducts(updatedProducts);
       setLocal(STORAGE_KEYS.PRODUCTS, updatedProducts);
@@ -894,28 +1259,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (inv.customer_id) {
         const custIndex = customers.findIndex((c) => c.id === inv.customer_id);
         if (custIndex >= 0) {
-          const cust = { ...customers[custIndex] };
-          cust.total_purchases = Math.max(0, cust.total_purchases - inv.grand_total);
-          cust.total_paid = Math.max(0, cust.total_paid - inv.paid_amount);
-          cust.outstanding_due = Math.max(0, cust.outstanding_due - inv.due_amount);
+          const prevCust = customers[custIndex];
+          const cust: Customer = {
+            ...prevCust,
+            total_purchases: Math.max(0, prevCust.total_purchases - inv.grand_total),
+            total_paid: Math.max(0, prevCust.total_paid - inv.paid_amount),
+            outstanding_due: Math.max(0, prevCust.outstanding_due - inv.due_amount),
+            updated_at: now,
+            version: (prevCust.version || 1) + 1,
+          };
           const updatedCusts = [...customers];
           updatedCusts[custIndex] = cust;
           setCustomers(updatedCusts);
           setLocal(STORAGE_KEYS.CUSTOMERS, updatedCusts);
+          enqueueSyncOperation({
+            collection_name: 'customers',
+            doc_id: cust.id,
+            op_type: 'upsert',
+            payload: cust,
+            version: cust.version,
+            updated_at: now,
+          });
         }
       }
 
       markUserHasRealData();
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [invoices, products, settings.business_id, stockMovements, customers]
+    [invoices, products, settings.business_id, stockMovements, customers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // Purchase Recording
   const recordPurchase = useCallback(
     (data: Omit<Purchase, 'id' | 'purchase_number' | 'created_at'>): Purchase => {
       const now = new Date();
+      const nowIso = now.toISOString();
       const count = purchases.length + 1;
       const purchaseNumber = `PUR-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}-${String(count).padStart(3, '0')}`;
 
@@ -923,14 +1304,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...data,
         id: `pur_${Date.now()}`,
         purchase_number: purchaseNumber,
-        created_at: now.toISOString(),
+        created_at: nowIso,
+        updated_at: nowIso,
+        version: 1,
       };
 
       const updatedPurchases = [newPurchase, ...purchases];
       setPurchases(updatedPurchases);
       setLocal(STORAGE_KEYS.PURCHASES, updatedPurchases);
+      enqueueSyncOperation({
+        collection_name: 'purchases',
+        doc_id: newPurchase.id,
+        op_type: 'upsert',
+        payload: newPurchase,
+        version: 1,
+        updated_at: nowIso,
+      });
 
       const updatedProducts = [...products];
+      const touchedProductIds = new Set<string>();
       const newMovements: StockMovement[] = [];
 
       for (const item of newPurchase.items) {
@@ -943,8 +1335,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               if (v.size_weight !== item.size_weight || v.unit !== item.unit) return v;
               const prev = v.stock_quantity;
               const added = prev + item.quantity;
-              newMovements.push({
-                id: `mov_pur_${Date.now()}_${v.id}`,
+              const mov: StockMovement = {
+                id: `mov_pur_${Date.now()}_${v.id}_${Math.random().toString(36).slice(2, 5)}`,
                 business_id: settings.business_id,
                 product_id: prod.id,
                 variant_id: v.id,
@@ -955,15 +1347,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 previous_stock: prev,
                 new_stock: added,
                 reference_id: purchaseNumber,
-                timestamp: now.toISOString(),
+                timestamp: nowIso,
+                updated_at: nowIso,
+                version: 1,
+              };
+              newMovements.push(mov);
+              enqueueSyncOperation({
+                collection_name: 'stock_movements',
+                doc_id: mov.id,
+                op_type: 'upsert',
+                payload: mov,
+                version: 1,
+                updated_at: nowIso,
               });
               return { ...v, stock_quantity: added };
             });
             return { ...q, variants };
           });
+          prod.updated_at = nowIso;
+          prod.version = (prod.version || 1) + 1;
           updatedProducts[prodIndex] = prod;
+          touchedProductIds.add(prod.id);
         }
       }
+
+      touchedProductIds.forEach((pid) => {
+        const prod = updatedProducts.find((p) => p.id === pid);
+        if (prod) {
+          enqueueSyncOperation({
+            collection_name: 'products',
+            doc_id: prod.id,
+            op_type: 'upsert',
+            payload: prod,
+            version: prod.version,
+            updated_at: nowIso,
+          });
+        }
+      });
 
       setProducts(updatedProducts);
       setLocal(STORAGE_KEYS.PRODUCTS, updatedProducts);
@@ -975,23 +1395,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (newPurchase.supplier_id) {
         const suppIndex = suppliers.findIndex((s) => s.id === newPurchase.supplier_id);
         if (suppIndex >= 0) {
-          const supp = { ...suppliers[suppIndex] };
-          supp.total_purchased += newPurchase.grand_total;
-          supp.total_paid += newPurchase.paid_amount;
-          supp.outstanding_due += newPurchase.supplier_due;
+          const prevSupp = suppliers[suppIndex];
+          const supp: Supplier = {
+            ...prevSupp,
+            total_purchased: prevSupp.total_purchased + newPurchase.grand_total,
+            total_paid: prevSupp.total_paid + newPurchase.paid_amount,
+            outstanding_due: prevSupp.outstanding_due + newPurchase.supplier_due,
+            updated_at: nowIso,
+            version: (prevSupp.version || 1) + 1,
+          };
           const updatedSupps = [...suppliers];
           updatedSupps[suppIndex] = supp;
           setSuppliers(updatedSupps);
           setLocal(STORAGE_KEYS.SUPPLIERS, updatedSupps);
+          enqueueSyncOperation({
+            collection_name: 'suppliers',
+            doc_id: supp.id,
+            op_type: 'upsert',
+            payload: supp,
+            version: supp.version,
+            updated_at: nowIso,
+          });
         }
       }
 
       markUserHasRealData();
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
       return newPurchase;
     },
-    [purchases, products, settings.business_id, stockMovements, suppliers]
+    [purchases, products, settings.business_id, stockMovements, suppliers, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // Manual Stock Adjustment
@@ -1006,7 +1441,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const prodIndex = products.findIndex((p) => p.id === productId);
       if (prodIndex < 0) return;
 
-      const prod = { ...products[prodIndex] };
+      const nowIso = new Date().toISOString();
+      const prevProd = products[prodIndex];
+      const nextProdVersion = (prevProd.version || 1) + 1;
+      const prod: Product = {
+        ...prevProd,
+        updated_at: nowIso,
+        version: nextProdVersion,
+      };
       let prevStock = 0;
       let newStock = 0;
       let variantDescription = '';
@@ -1033,6 +1475,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       updatedProducts[prodIndex] = prod;
       setProducts(updatedProducts);
       setLocal(STORAGE_KEYS.PRODUCTS, updatedProducts);
+      enqueueSyncOperation({
+        collection_name: 'products',
+        doc_id: prod.id,
+        op_type: 'upsert',
+        payload: prod,
+        version: nextProdVersion,
+        updated_at: nowIso,
+      });
 
       const movement: StockMovement = {
         id: `mov_adj_${Date.now()}`,
@@ -1046,36 +1496,61 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         previous_stock: prevStock,
         new_stock: newStock,
         notes,
-        timestamp: new Date().toISOString(),
+        timestamp: nowIso,
+        updated_at: nowIso,
+        version: 1,
       };
 
       const allMovements = [movement, ...stockMovements];
       setStockMovements(allMovements);
       setLocal(STORAGE_KEYS.STOCK_MOVEMENTS, allMovements);
+      enqueueSyncOperation({
+        collection_name: 'stock_movements',
+        doc_id: movement.id,
+        op_type: 'upsert',
+        payload: movement,
+        version: 1,
+        updated_at: nowIso,
+      });
       markUserHasRealData();
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [products, settings.allow_negative_stock, settings.business_id, stockMovements]
+    [products, settings.allow_negative_stock, settings.business_id, stockMovements, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // Expenses CRUD
   const addExpense = useCallback(
     (data: Omit<Expense, 'id' | 'created_at'>): Expense => {
+      const nowIso = new Date().toISOString();
       const newExp: Expense = {
         ...data,
         id: `exp_${Date.now()}`,
-        created_at: new Date().toISOString(),
+        created_at: nowIso,
+        updated_at: nowIso,
+        version: 1,
       };
       const updated = [newExp, ...expenses];
       setExpenses(updated);
       setLocal(STORAGE_KEYS.EXPENSES, updated);
       markUserHasRealData();
+      enqueueSyncOperation({
+        collection_name: 'expenses',
+        doc_id: newExp.id,
+        op_type: 'upsert',
+        payload: newExp,
+        version: 1,
+        updated_at: nowIso,
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
       return newExp;
     },
-    [expenses]
+    [expenses, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   const deleteExpense = useCallback(
@@ -1085,10 +1560,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setLocal(STORAGE_KEYS.EXPENSES, updated);
       markUserHasRealData();
       queueCloudDeletion('expenses', id);
+      enqueueSyncOperation({
+        collection_name: 'expenses',
+        doc_id: id,
+        op_type: 'delete',
+        updated_at: new Date().toISOString(),
+      });
+      registerBackgroundSyncTag();
+      refreshSqliteDiagnostics();
       setPendingCloudSync(true);
       setSyncStatus('pending');
     },
-    [expenses]
+    [expenses, refreshSqliteDiagnostics, registerBackgroundSyncTag]
   );
 
   // JSON Export / Import
@@ -1109,60 +1592,152 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return JSON.stringify(backup, null, 2);
   }, [settings, products, customers, suppliers, invoices, purchases, stockMovements, payments, expenses]);
 
-  const importDatabaseJson = useCallback((jsonStr: string): boolean => {
-    try {
-      const data = JSON.parse(jsonStr);
-      if (!data.products || !Array.isArray(data.products)) return false;
-      if (data.settings) {
-        setSettings(data.settings);
-        setLocal(STORAGE_KEYS.SETTINGS, data.settings);
+  const importDatabaseJson = useCallback(
+    (jsonStr: string): boolean => {
+      try {
+        const data = JSON.parse(jsonStr);
+        if (!data.products || !Array.isArray(data.products)) return false;
+
+        // Safety snapshot before replacing database
+        createDatabaseSnapshot('pre_restore');
+
+        if (data.settings) {
+          setSettings(data.settings);
+          setLocal(STORAGE_KEYS.SETTINGS, data.settings);
+        }
+        if (data.categories && Array.isArray(data.categories)) {
+          setCategories(data.categories);
+          setLocal(STORAGE_KEYS.CATEGORIES, data.categories);
+        }
+        if (data.products) {
+          setProducts(data.products);
+          setLocal(STORAGE_KEYS.PRODUCTS, data.products);
+        }
+        if (data.customers) {
+          setCustomers(data.customers);
+          setLocal(STORAGE_KEYS.CUSTOMERS, data.customers);
+        }
+        if (data.suppliers) {
+          setSuppliers(data.suppliers);
+          setLocal(STORAGE_KEYS.SUPPLIERS, data.suppliers);
+        }
+        if (data.invoices) {
+          setInvoices(data.invoices);
+          setLocal(STORAGE_KEYS.INVOICES, data.invoices);
+        }
+        if (data.purchases) {
+          setPurchases(data.purchases);
+          setLocal(STORAGE_KEYS.PURCHASES, data.purchases);
+        }
+        if (data.stockMovements) {
+          setStockMovements(data.stockMovements);
+          setLocal(STORAGE_KEYS.STOCK_MOVEMENTS, data.stockMovements);
+        }
+        if (data.payments) {
+          setPayments(data.payments);
+          setLocal(STORAGE_KEYS.PAYMENTS, data.payments);
+        }
+        if (data.expenses) {
+          setExpenses(data.expenses);
+          setLocal(STORAGE_KEYS.EXPENSES, data.expenses);
+        }
+        markUserHasRealData();
+        setPendingCloudSync(true);
+        scheduleSqlitePersist(true);
+        refreshSqliteDiagnostics();
+        return true;
+      } catch {
+        return false;
       }
-      if (data.products) {
-        setProducts(data.products);
-        setLocal(STORAGE_KEYS.PRODUCTS, data.products);
+    },
+    [refreshSqliteDiagnostics]
+  );
+
+  // Rolling Snapshots & SQLite Binary Export/Import Recovery
+  const createManualSnapshot = useCallback((): DatabaseSnapshotMeta | null => {
+    const snap = createDatabaseSnapshot('manual');
+    refreshSqliteDiagnostics();
+    return snap;
+  }, [refreshSqliteDiagnostics]);
+
+  const restoreFromSnapshot = useCallback(
+    (snapshotId: string): boolean => {
+      const payload = getSnapshotPayloadById(snapshotId);
+      if (!payload || !Array.isArray(payload.products)) return false;
+
+      // Save safety pre-restore snapshot first
+      createDatabaseSnapshot('pre_restore');
+
+      if (payload.settings) {
+        setSettings(payload.settings);
+        setLocal(STORAGE_KEYS.SETTINGS, payload.settings);
       }
-      if (data.customers) {
-        setCustomers(data.customers);
-        setLocal(STORAGE_KEYS.CUSTOMERS, data.customers);
+      if (payload.categories && payload.categories.length > 0) {
+        setCategories(payload.categories);
+        setLocal(STORAGE_KEYS.CATEGORIES, payload.categories);
       }
-      if (data.suppliers) {
-        setSuppliers(data.suppliers);
-        setLocal(STORAGE_KEYS.SUPPLIERS, data.suppliers);
-      }
-      if (data.invoices) {
-        setInvoices(data.invoices);
-        setLocal(STORAGE_KEYS.INVOICES, data.invoices);
-      }
-      if (data.purchases) {
-        setPurchases(data.purchases);
-        setLocal(STORAGE_KEYS.PURCHASES, data.purchases);
-      }
-      if (data.stockMovements) {
-        setStockMovements(data.stockMovements);
-        setLocal(STORAGE_KEYS.STOCK_MOVEMENTS, data.stockMovements);
-      }
-      if (data.payments) {
-        setPayments(data.payments);
-        setLocal(STORAGE_KEYS.PAYMENTS, data.payments);
-      }
-      if (data.expenses) {
-        setExpenses(data.expenses);
-        setLocal(STORAGE_KEYS.EXPENSES, data.expenses);
-      }
+      setProducts(payload.products);
+      setLocal(STORAGE_KEYS.PRODUCTS, payload.products);
+      setCustomers(payload.customers || []);
+      setLocal(STORAGE_KEYS.CUSTOMERS, payload.customers || []);
+      setSuppliers(payload.suppliers || []);
+      setLocal(STORAGE_KEYS.SUPPLIERS, payload.suppliers || []);
+      setInvoices(payload.invoices || []);
+      setLocal(STORAGE_KEYS.INVOICES, payload.invoices || []);
+      setPurchases(payload.purchases || []);
+      setLocal(STORAGE_KEYS.PURCHASES, payload.purchases || []);
+      setStockMovements(payload.stockMovements || []);
+      setLocal(STORAGE_KEYS.STOCK_MOVEMENTS, payload.stockMovements || []);
+      setPayments(payload.payments || []);
+      setLocal(STORAGE_KEYS.PAYMENTS, payload.payments || []);
+      setExpenses(payload.expenses || []);
+      setLocal(STORAGE_KEYS.EXPENSES, payload.expenses || []);
+
       markUserHasRealData();
       setPendingCloudSync(true);
+      scheduleSqlitePersist(true);
+      refreshSqliteDiagnostics();
       return true;
-    } catch {
-      return false;
-    }
+    },
+    [refreshSqliteDiagnostics]
+  );
+
+  const exportSqliteFile = useCallback((): Uint8Array | null => {
+    return exportSqliteBinary();
   }, []);
 
-  // Firebase Auth Actions
+  const importSqliteFile = useCallback(
+    async (bytes: Uint8Array): Promise<boolean> => {
+      const ok = await importSqliteBinary(bytes);
+      if (!ok) return false;
+
+      setSettings(getLocal<BusinessSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS));
+      setCategories(getLocal<string[]>(STORAGE_KEYS.CATEGORIES, INITIAL_CATEGORIES));
+      setProducts(getLocal<Product[]>(STORAGE_KEYS.PRODUCTS, []));
+      setCustomers(getLocal<Customer[]>(STORAGE_KEYS.CUSTOMERS, []));
+      setSuppliers(getLocal<Supplier[]>(STORAGE_KEYS.SUPPLIERS, []));
+      setInvoices(getLocal<Invoice[]>(STORAGE_KEYS.INVOICES, []));
+      setPurchases(getLocal<Purchase[]>(STORAGE_KEYS.PURCHASES, []));
+      setStockMovements(getLocal<StockMovement[]>(STORAGE_KEYS.STOCK_MOVEMENTS, []));
+      setPayments(getLocal<PaymentRecord[]>(STORAGE_KEYS.PAYMENTS, []));
+      setExpenses(getLocal<Expense[]>(STORAGE_KEYS.EXPENSES, []));
+      markUserHasRealData();
+      setPendingCloudSync(true);
+      refreshSqliteDiagnostics();
+      return true;
+    },
+    [refreshSqliteDiagnostics]
+  );
+
+  // Firebase Auth Actions & Offline Session/PIN Unlock
   const loginWithEmail = useCallback(async (email: string, password: string) => {
     setAuthError(null);
     try {
       const profile = await signInWithFirebaseEmail(email, password);
       setCurrentUser(profile);
+      setCachedOfflineUser(profile);
+      setHasOfflinePin(hasOfflineUnlockPin(profile.uid));
+      setIsSessionLockedOffline(false);
       return { success: true };
     } catch (err: any) {
       const msg = err?.message || 'Sign in failed.';
@@ -1176,6 +1751,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const profile = await signInWithFirebaseGoogle();
       setCurrentUser(profile);
+      setCachedOfflineUser(profile);
+      setHasOfflinePin(hasOfflineUnlockPin(profile.uid));
+      setIsSessionLockedOffline(false);
       return { success: true };
     } catch (err: any) {
       const msg = err?.message || 'Google sign in failed.';
@@ -1189,6 +1767,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const profile = await bootstrapRootAdminAccount(email, password, name);
       setCurrentUser(profile);
+      setCachedOfflineUser(profile);
+      setHasOfflinePin(hasOfflineUnlockPin(profile.uid));
+      setIsSessionLockedOffline(false);
       return { success: true };
     } catch (err: any) {
       const msg = err?.message || 'Root Admin setup failed.';
@@ -1197,9 +1778,65 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, []);
 
+  const unlockOfflineSession = useCallback(
+    async (pin?: string): Promise<{ success: boolean; error?: string }> => {
+      const cached = cachedOfflineUser || getAnyCachedAuthUser();
+      if (!cached) {
+        return {
+          success: false,
+          error: 'No cached session found. Connect to the internet once to sign in first.',
+        };
+      }
+      if (hasOfflineUnlockPin(cached.uid)) {
+        if (!pin || !pin.trim()) {
+          return { success: false, error: 'Please enter your Offline Unlock PIN.' };
+        }
+        const ok = await verifyOfflineUnlockPin(cached.uid, pin);
+        if (!ok) {
+          return { success: false, error: 'Incorrect Offline PIN. Please try again.' };
+        }
+      }
+      setCurrentUser(cached);
+      setCachedOfflineUser(cached);
+      setIsSessionLockedOffline(false);
+      setAuthError(null);
+      return { success: true };
+    },
+    [cachedOfflineUser]
+  );
+
+  const setOfflinePin = useCallback(
+    async (pin: string): Promise<{ success: boolean; error?: string }> => {
+      const user = currentUser || cachedOfflineUser;
+      if (!user) {
+        return { success: false, error: 'No active user account to bind PIN.' };
+      }
+      const clean = pin.trim();
+      if (!/^\d{4,6}$/.test(clean)) {
+        return { success: false, error: 'PIN must be 4 to 6 numeric digits.' };
+      }
+      await setOfflineUnlockPin(user.uid, clean);
+      setHasOfflinePin(true);
+      return { success: true };
+    },
+    [currentUser, cachedOfflineUser]
+  );
+
+  const removeOfflinePin = useCallback(() => {
+    clearOfflineUnlockPin();
+    setHasOfflinePin(false);
+  }, []);
+
+  const lockSessionOffline = useCallback(() => {
+    setShowLoginModal(false);
+    setIsSessionLockedOffline(true);
+  }, []);
+
   const logout = useCallback(async () => {
     await signOutFirebase();
     setCurrentUser(null);
+    setCachedOfflineUser(null);
+    setIsSessionLockedOffline(false);
     setUsers([]);
     setShowLoginModal(false);
     setActiveModule('home');
@@ -1266,28 +1903,56 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [currentUser]
   );
 
-  const addCategory = useCallback((newCat: string) => {
-    const trimmed = newCat.trim();
-    if (!trimmed) return;
-    setCategories((prev) => {
-      if (prev.includes(trimmed)) return prev;
-      const updated = [...prev, trimmed];
-      setLocal(STORAGE_KEYS.CATEGORIES, updated);
-      markUserHasRealData();
-      setPendingCloudSync(true);
-      return updated;
-    });
-  }, []);
+  const addCategory = useCallback(
+    (newCat: string) => {
+      const trimmed = newCat.trim();
+      if (!trimmed) return;
+      const now = new Date().toISOString();
+      setCategories((prev) => {
+        if (prev.includes(trimmed)) return prev;
+        const updated = [...prev, trimmed];
+        setLocal(STORAGE_KEYS.CATEGORIES, updated);
+        markUserHasRealData();
+        setPendingCloudSync(true);
+        enqueueSyncOperation({
+          collection_name: 'system',
+          doc_id: 'categories',
+          op_type: 'upsert',
+          payload: { list: updated },
+          version: updated.length,
+          updated_at: now,
+        });
+        registerBackgroundSyncTag();
+        return updated;
+      });
+      refreshSqliteDiagnostics();
+    },
+    [refreshSqliteDiagnostics, registerBackgroundSyncTag]
+  );
 
-  const deleteCategory = useCallback((catToDelete: string) => {
-    setCategories((prev) => {
-      const updated = prev.filter((c) => c !== catToDelete);
-      setLocal(STORAGE_KEYS.CATEGORIES, updated);
-      markUserHasRealData();
-      setPendingCloudSync(true);
-      return updated;
-    });
-  }, []);
+  const deleteCategory = useCallback(
+    (catToDelete: string) => {
+      const now = new Date().toISOString();
+      setCategories((prev) => {
+        const updated = prev.filter((c) => c !== catToDelete);
+        setLocal(STORAGE_KEYS.CATEGORIES, updated);
+        markUserHasRealData();
+        setPendingCloudSync(true);
+        enqueueSyncOperation({
+          collection_name: 'system',
+          doc_id: 'categories',
+          op_type: 'upsert',
+          payload: { list: updated },
+          version: updated.length,
+          updated_at: now,
+        });
+        registerBackgroundSyncTag();
+        return updated;
+      });
+      refreshSqliteDiagnostics();
+    },
+    [refreshSqliteDiagnostics, registerBackgroundSyncTag]
+  );
 
   // Always keep a ref to latest store state so async auto-sync & reconnect handlers never push stale state
   const latestStoreRef = useRef({
@@ -1317,6 +1982,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [products, customers, suppliers, invoices, purchases, stockMovements, payments, expenses, categories, settings]);
 
+  // Flush persistent SQLite sync_queue cleanly to Firestore
+  const flushPendingQueue = useCallback(async (): Promise<boolean> => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return false;
+    }
+    const queue = getPendingSyncQueue();
+    if (queue.length === 0) return true;
+
+    const res = await flushSyncQueueToFirebase(queue);
+    if (res.success && res.processedIds.length > 0) {
+      removeSyncQueueItems(res.processedIds);
+      refreshSqliteDiagnostics();
+      return true;
+    }
+    if (!res.success && res.error) {
+      markSyncQueueAttemptError(
+        queue.map((q) => q.op_id),
+        res.error
+      );
+      refreshSqliteDiagnostics();
+    }
+    return false;
+  }, [refreshSqliteDiagnostics]);
+
   const syncToFirebase = useCallback(async (): Promise<boolean> => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       setFirebaseSyncStatus('disconnected');
@@ -1324,29 +2013,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
     setFirebaseSyncStatus('syncing');
+    setSyncStatus('syncing');
     try {
+      await flushPendingQueue();
       const snapshot = latestStoreRef.current;
       const res = await syncStoreToFirebase({
         ...snapshot,
         deletedRefs: getQueuedCloudDeletions(),
       });
       if (res.success) {
+        const remainingQueue = getPendingSyncQueue();
+        if (remainingQueue.length > 0) {
+          removeSyncQueueItems(remainingQueue.map((q) => q.op_id));
+        }
         setPendingCloudSync(false);
         clearQueuedCloudDeletions();
         setSyncStatus('synced');
         setFirebaseSyncStatus('synced');
         setLastFirebaseSync(res.syncedAt);
         localStorage.setItem('bm_last_fb_sync', res.syncedAt);
+        refreshSqliteDiagnostics();
         return true;
       } else {
         setFirebaseSyncStatus('error');
+        setSyncStatus('pending');
         return false;
       }
     } catch {
       setFirebaseSyncStatus('error');
+      setSyncStatus('pending');
       return false;
     }
-  }, []);
+  }, [flushPendingQueue, refreshSqliteDiagnostics]);
 
   const syncFromFirebase = useCallback(async (): Promise<boolean> => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -1360,8 +2058,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const cloud = res.data;
         const localAlreadyHasUserEdits = hasRealUserData();
         const deletedQueue = getQueuedCloudDeletions();
+        const detectedConflicts: ConflictRecord[] = [];
 
-        const mergeList = <T extends { id: string; updated_at?: string; created_at?: string; date?: string; timestamp?: string }>(
+        const mergeList = <
+          T extends {
+            id: string;
+            version?: number;
+            updated_at?: string;
+            created_at?: string;
+            date?: string;
+            timestamp?: string;
+          }
+        >(
           localItems: T[],
           cloudItems: T[] | undefined,
           collectionName: string
@@ -1381,10 +2089,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (!existing) {
               byId.set(localItem.id, localItem);
             } else {
-              const localTs = Date.parse(localItem.updated_at || localItem.created_at || localItem.date || localItem.timestamp || '') || 0;
-              const cloudTs = Date.parse(existing.updated_at || existing.created_at || existing.date || existing.timestamp || '') || 0;
-              if (localTs >= cloudTs) {
-                byId.set(localItem.id, localItem);
+              const { chosen, conflict } = resolveRecordConflict(
+                collectionName,
+                localItem,
+                existing
+              );
+              byId.set(localItem.id, chosen);
+              if (conflict) {
+                detectedConflicts.push(conflict);
               }
             }
           });
@@ -1465,6 +2177,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           restoredAny = true;
         }
 
+        if (detectedConflicts.length > 0) {
+          recordConflictsToSqlite(detectedConflicts);
+        }
+
         if (restoredAny) {
           markUserHasRealData();
         }
@@ -1473,6 +2189,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const now = new Date().toISOString();
         setLastFirebaseSync(now);
         localStorage.setItem('bm_last_fb_sync', now);
+        refreshSqliteDiagnostics();
         return true;
       } else {
         setFirebaseSyncStatus('error');
@@ -1482,9 +2199,58 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setFirebaseSyncStatus('error');
       return false;
     }
-  }, []);
+  }, [refreshSqliteDiagnostics]);
 
-  // Auto-restore cloud data on login / post-update boot, and flush offline queue first if pending
+  // Real Bi-Directional Manual Sync (replaces placeholder delay)
+  const triggerSyncNow = useCallback(async () => {
+    const nowIso = new Date().toISOString();
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      const pendingCount = getPendingSyncQueue().length;
+      const offlineLog: SyncLog = {
+        id: `sync_${Date.now()}`,
+        timestamp: nowIso,
+        action: 'Offline Queue Check',
+        status: 'pending',
+        details: `Offline mode active. ${pendingCount} queued change(s) safely saved in SQLite for background sync.`,
+      };
+      const updatedLogs = [offlineLog, ...syncLogs].slice(0, 30);
+      setSyncLogs(updatedLogs);
+      setLocal(STORAGE_KEYS.SYNC_LOGS, updatedLogs);
+      setSyncStatus('pending');
+      return;
+    }
+
+    setSyncStatus('syncing');
+    const pushed = await syncToFirebase();
+    const pulled = await syncFromFirebase();
+
+    const snap = latestStoreRef.current;
+    const newLog: SyncLog = {
+      id: `sync_${Date.now()}`,
+      timestamp: nowIso,
+      action: 'Firebase Push & Pull Sync',
+      status: pushed && pulled ? 'synced' : 'failed',
+      details:
+        pushed && pulled
+          ? `Synced ${snap.products.length} products, ${snap.invoices.length} invoices & ${snap.customers.length} customers with Firestore.`
+          : 'Cloud sync partially failed. All changes remain safe in local SQLite.',
+    };
+    const updatedLogs = [newLog, ...syncLogs].slice(0, 30);
+    setSyncLogs(updatedLogs);
+    setLocal(STORAGE_KEYS.SYNC_LOGS, updatedLogs);
+    if (pushed && pulled) {
+      setSettings((prev) => {
+        const updated = { ...prev, last_sync_time: nowIso };
+        setLocal(STORAGE_KEYS.SETTINGS, updated);
+        return updated;
+      });
+      setSyncStatus('synced');
+    } else {
+      setSyncStatus('pending');
+    }
+  }, [syncLogs, syncToFirebase, syncFromFirebase]);
+
+  // Auto-restore cloud data on login / post-update boot, and flush offline SQLite queue first if pending
   const restoredForUidRef = useRef<string | null>(null);
   useEffect(() => {
     if (!currentUser) {
@@ -1500,7 +2266,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     let cancelled = false;
     (async () => {
-      if (hasPendingCloudSync()) {
+      if (hasPendingCloudSync() || getPendingSyncQueue().length > 0) {
         await syncToFirebase();
       }
       if (!cancelled) {
@@ -1513,10 +2279,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [currentUser, syncToFirebase, syncFromFirebase]);
 
-  // Flush pending offline edits automatically when network comes back online
+  // Flush pending offline edits automatically when network comes back online or tab becomes visible
   useEffect(() => {
+    const runAutoFlush = () => {
+      if (!navigator.onLine || !currentUser || !autoFirebaseSync) return;
+      if (hasPendingCloudSync() || getPendingSyncQueue().length > 0) {
+        syncToFirebase();
+      }
+    };
+
     if (isOnline && currentUser) {
-      if (hasPendingCloudSync() && autoFirebaseSync) {
+      if ((hasPendingCloudSync() || getPendingSyncQueue().length > 0) && autoFirebaseSync) {
         syncToFirebase();
       } else if (restoredForUidRef.current !== currentUser.uid) {
         restoredForUidRef.current = currentUser.uid;
@@ -1527,16 +2300,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } else if (!isOnline) {
       setFirebaseSyncStatus('disconnected');
     }
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        runAutoFlush();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [isOnline, currentUser, autoFirebaseSync, syncToFirebase, syncFromFirebase]);
 
-  // Automatic Firebase Sync effect: Debounced cloud backup whenever local state changes while online
+  // Automatic Firebase Sync effect: Debounced SQLite queue flush + cloud backup while online
   const hasMountedFirebaseRef = useRef(false);
   useEffect(() => {
     if (!hasMountedFirebaseRef.current) {
       hasMountedFirebaseRef.current = true;
       return;
     }
-    if (!currentUser || !autoFirebaseSync || !navigator.onLine || !hasPendingCloudSync()) return;
+    if (!currentUser || !autoFirebaseSync || !navigator.onLine) return;
+    if (!hasPendingCloudSync() && getPendingSyncQueue().length === 0) return;
+
     const timer = setTimeout(() => {
       syncToFirebase();
     }, 2000);
@@ -1556,6 +2342,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     settings,
     syncToFirebase,
   ]);
+
+  // Rolling Auto-Backup scheduler inside SQLite (startup check + every 10 minutes)
+  useEffect(() => {
+    const checkAndCreateAutoSnapshot = () => {
+      if (!hasRealUserData()) return;
+      const existing = listDatabaseSnapshots();
+      const latestTs = existing[0] ? Date.parse(existing[0].created_at) || 0 : 0;
+      const ageMs = Date.now() - latestTs;
+      if (existing.length === 0 || ageMs >= 10 * 60 * 1000) {
+        createDatabaseSnapshot('auto');
+        refreshSqliteDiagnostics();
+      }
+    };
+
+    const bootTimer = setTimeout(checkAndCreateAutoSnapshot, 4000);
+    const interval = setInterval(checkAndCreateAutoSnapshot, 10 * 60 * 1000);
+
+    return () => {
+      clearTimeout(bootTimer);
+      clearInterval(interval);
+    };
+  }, [refreshSqliteDiagnostics]);
+
+  // Pre-warm offline SQLite + CacheStorage product image cache whenever online
+  useEffect(() => {
+    if (!isOnline || products.length === 0) return;
+    const urls = products.map((p) => p.image_url);
+    warmImageCache(urls);
+    const timer = setTimeout(() => {
+      refreshSqliteDiagnostics();
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [isOnline, products, refreshSqliteDiagnostics]);
 
   const value = useMemo(
     () => ({
@@ -1629,6 +2448,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       syncToFirebase,
       syncFromFirebase,
       lastFirebaseSync,
+      cachedOfflineUser,
+      hasOfflinePin,
+      isSessionLockedOffline,
+      unlockOfflineSession,
+      setOfflinePin,
+      removeOfflinePin,
+      lockSessionOffline,
+      sqliteStats,
+      snapshots,
+      conflicts,
+      createManualSnapshot,
+      restoreFromSnapshot,
+      exportSqliteFile,
+      importSqliteFile,
+      refreshSqliteDiagnostics,
     }),
     [
       activeModule,
@@ -1697,6 +2531,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       syncToFirebase,
       syncFromFirebase,
       lastFirebaseSync,
+      cachedOfflineUser,
+      hasOfflinePin,
+      isSessionLockedOffline,
+      unlockOfflineSession,
+      setOfflinePin,
+      removeOfflinePin,
+      lockSessionOffline,
+      sqliteStats,
+      snapshots,
+      conflicts,
+      createManualSnapshot,
+      restoreFromSnapshot,
+      exportSqliteFile,
+      importSqliteFile,
+      refreshSqliteDiagnostics,
     ]
   );
 

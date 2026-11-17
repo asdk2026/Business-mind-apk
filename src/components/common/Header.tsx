@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Product } from '../../types';
+import { CachedImage } from './CachedImage';
 
 interface HeaderProps {
   onSelectProduct?: (product: Product) => void;
@@ -159,16 +160,12 @@ export const Header: React.FC<HeaderProps> = ({ onSelectProduct }) => {
                     className="w-full p-2.5 flex items-center gap-3 hover:bg-slate-800/70 transition-colors text-left group"
                   >
                     <div className="w-10 h-10 rounded-lg bg-slate-800 overflow-hidden shrink-0 border border-slate-700/60 flex items-center justify-center">
-                      {prod.image_url ? (
-                        <img
-                          src={prod.image_url}
-                          alt={prod.name}
-                          referrerPolicy="no-referrer"
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <Package className="w-5 h-5 text-slate-500" />
-                      )}
+                      <CachedImage
+                        src={prod.image_url}
+                        alt={prod.name}
+                        className="w-full h-full object-cover"
+                        fallbackIconClassName="w-5 h-5 text-slate-500"
+                      />
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between">

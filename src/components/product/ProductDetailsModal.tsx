@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Product } from '../../types';
 import { useApp } from '../../context/AppContext';
+import { CachedImage } from '../common/CachedImage';
 
 interface ProductDetailsModalProps {
   product: Product | null;
@@ -64,16 +65,12 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
           {/* Top Info Banner with Image */}
           <div className="flex flex-col sm:flex-row gap-4 items-start">
             <div className="w-full sm:w-44 h-36 rounded-xl bg-slate-800 border border-slate-700/60 overflow-hidden flex items-center justify-center shrink-0">
-              {product.image_url ? (
-                <img
-                  src={product.image_url}
-                  alt={product.name}
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                <Package className="w-12 h-12 text-slate-600" />
-              )}
+              <CachedImage
+                src={product.image_url}
+                alt={product.name}
+                className="w-full h-full object-cover"
+                fallbackIconClassName="w-12 h-12 text-slate-600"
+              />
             </div>
 
             <div className="flex-1 space-y-2">

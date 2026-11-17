@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { Product, ProductVariant, ProductQuality } from '../../types';
 import { useApp } from '../../context/AppContext';
+import { CachedImage } from '../common/CachedImage';
 
 interface ProductSelectModalProps {
   onClose: () => void;
@@ -116,16 +117,12 @@ export const ProductSelectModal: React.FC<ProductSelectModalProps> = ({
                 {/* Product Header */}
                 <div className="flex items-start gap-3">
                   <div className="w-12 h-12 rounded-lg bg-slate-800 border border-slate-700 overflow-hidden flex items-center justify-center shrink-0">
-                    {product.image_url ? (
-                      <img
-                        src={product.image_url}
-                        alt={product.name}
-                        referrerPolicy="no-referrer"
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <Package className="w-6 h-6 text-slate-500" />
-                    )}
+                    <CachedImage
+                      src={product.image_url}
+                      alt={product.name}
+                      className="w-full h-full object-cover"
+                      fallbackIconClassName="w-6 h-6 text-slate-500"
+                    />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between">

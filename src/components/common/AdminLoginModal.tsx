@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ShieldCheck,
@@ -8,6 +8,8 @@ import {
   CheckCircle2,
   XCircle,
   Sliders,
+  KeyRound,
+  Lock,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { MODULE_PERMISSION_LIST, ACTION_PERMISSION_LIST } from '../../utils/permissions';
@@ -21,11 +23,36 @@ export const AdminLoginModal: React.FC = () => {
     setShowLoginModal,
     setActiveModule,
     language,
+    hasOfflinePin,
+    setOfflinePin,
+    removeOfflinePin,
+    lockSessionOffline,
   } = useApp();
+
+  const [pinInput, setPinInput] = useState('');
+  const [pinStatus, setPinStatus] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
   if (!showLoginModal || !currentUser) return null;
 
   const isBn = language === 'bn';
+
+  const handleSavePin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPinStatus(null);
+    const res = await setOfflinePin(pinInput);
+    if (res.success) {
+      setPinInput('');
+      setPinStatus({
+        text: isBn ? 'অফলাইন আনলক পিন সংরক্ষণ করা হয়েছে।' : 'Offline Unlock PIN saved securely in SQLite.',
+        type: 'success',
+      });
+    } else {
+      setPinStatus({
+        text: res.error || 'Failed to save PIN.',
+        type: 'error',
+      });
+    }
+  };
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-sm animate-fade-in text-slate-100">
@@ -41,7 +68,7 @@ export const AdminLoginModal: React.FC = () => {
                 {isBn ? 'ফায়ারবেস অ্যাকাউন্ট ও অ্যাক্সেস' : 'Firebase Account & Access'}
               </h2>
               <p className="text-[11px] text-slate-400">
-                Real-Time Firestore RBAC Session
+                Real-Time Firestore RBAC & Offline PIN Security
               </p>
             </div>
           </div>
@@ -85,6 +112,69 @@ export const AdminLoginModal: React.FC = () => {
                 )}
               </div>
             </div>
+          </div>
+
+          {/* Offline Security & Local PIN Setup */}
+          <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold text-slate-300 flex items-center gap-1.5">
+                <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
+                <span>{isBn ? 'অফলাইন আনলক পিন (সিকিউরিটি)' : 'Offline Local Unlock PIN'}</span>
+              </span>
+              <span
+                className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                  hasOfflinePin
+                    ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-slate-800 text-slate-400'
+                }`}
+              >
+                {hasOfflinePin ? (isBn ? 'PIN সক্রিয়' : 'PIN Active') : isBn ? 'সেট নেই' : 'Not Set'}
+              </span>
+            </div>
+
+            <form onSubmit={handleSavePin} className="flex gap-2">
+              <input
+                type="password"
+                inputMode="numeric"
+                maxLength={6}
+                value={pinInput}
+                onChange={(e) => setPinInput(e.target.value.replace(/\D/g, ''))}
+                placeholder={hasOfflinePin ? 'New 4-6 digit PIN' : 'Set 4-6 digit PIN'}
+                className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono tracking-widest focus:border-emerald-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={pinInput.length < 4}
+                className="px-3 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 transition-colors"
+              >
+                {hasOfflinePin ? (isBn ? 'আপডেট' : 'Update') : isBn ? 'সেট পিন' : 'Save PIN'}
+              </button>
+              {hasOfflinePin && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    removeOfflinePin();
+                    setPinStatus({
+                      text: isBn ? 'অফলাইন পিন মুছে ফেলা হয়েছে।' : 'Offline PIN removed.',
+                      type: 'success',
+                    });
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 transition-colors"
+                >
+                  {isBn ? 'মুছুন' : 'Remove'}
+                </button>
+              )}
+            </form>
+
+            {pinStatus && (
+              <p
+                className={`text-[11px] ${
+                  pinStatus.type === 'success' ? 'text-emerald-400' : 'text-rose-400'
+                }`}
+              >
+                {pinStatus.text}
+              </p>
+            )}
           </div>
 
           {/* Current Permissions Summary */}
@@ -162,6 +252,15 @@ export const AdminLoginModal: React.FC = () => {
 
             <button
               type="button"
+              onClick={() => lockSessionOffline()}
+              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl font-semibold bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>{isBn ? 'লক স্ক্রিন' : 'Lock Terminal'}</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => {
                 logout();
               }}
@@ -174,7 +273,7 @@ export const AdminLoginModal: React.FC = () => {
             <button
               type="button"
               onClick={() => setShowLoginModal(false)}
-              className="flex-1 py-2.5 px-3 rounded-xl font-semibold bg-slate-800 hover:bg-slate-750 text-white border border-slate-700 transition-colors"
+              className="py-2.5 px-3 rounded-xl font-semibold bg-slate-800 hover:bg-slate-750 text-white border border-slate-700 transition-colors"
             >
               Close
             </button>

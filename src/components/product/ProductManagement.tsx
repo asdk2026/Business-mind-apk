@@ -15,6 +15,7 @@ import { useApp } from '../../context/AppContext';
 import { Product } from '../../types';
 import { ProductDetailsModal } from './ProductDetailsModal';
 import { ProductFormModal } from './ProductFormModal';
+import { CachedImage } from '../common/CachedImage';
 
 interface ProductManagementProps {
   onOpenPosWithProduct?: (prod: Product) => void;
@@ -214,16 +215,12 @@ export const ProductManagement: React.FC<ProductManagementProps> = ({ onOpenPosW
                   {/* Top Image + Info Header */}
                   <div className="flex gap-3 items-start mb-3">
                     <div className="w-16 h-16 rounded-xl bg-slate-800 border border-slate-700/60 overflow-hidden shrink-0 flex items-center justify-center">
-                      {product.image_url ? (
-                        <img
-                          src={product.image_url}
-                          alt={product.name}
-                          referrerPolicy="no-referrer"
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <Package className="w-7 h-7 text-slate-500" />
-                      )}
+                      <CachedImage
+                        src={product.image_url}
+                        alt={product.name}
+                        className="w-full h-full object-cover"
+                        fallbackIconClassName="w-7 h-7 text-slate-500"
+                      />
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between">

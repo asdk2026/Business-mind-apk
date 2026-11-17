@@ -12,6 +12,8 @@ import {
   LockKeyhole,
   CheckCircle2,
   Languages,
+  WifiOff,
+  Unlock,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { ROOT_ADMIN_EMAIL } from '../../utils/permissions';
@@ -26,11 +28,17 @@ export const FirebaseAuthGate: React.FC = () => {
     language,
     setLanguage,
     settings,
+    isOnline,
+    cachedOfflineUser,
+    hasOfflinePin,
+    isSessionLockedOffline,
+    unlockOfflineSession,
   } = useApp();
 
   const [mode, setMode] = useState<'login' | 'root_setup'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [offlinePinInput, setOfflinePinInput] = useState('');
   const [adminName, setAdminName] = useState('Primary Admin');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -38,6 +46,18 @@ export const FirebaseAuthGate: React.FC = () => {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   const displayError = localError || authError;
+
+  const handleOfflineUnlock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    clearAuthError();
+    setSubmitting(true);
+    const res = await unlockOfflineSession(offlinePinInput);
+    setSubmitting(false);
+    if (!res.success && res.error) {
+      setLocalError(res.error);
+    }
+  };
 
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -91,6 +111,8 @@ export const FirebaseAuthGate: React.FC = () => {
     }
   };
 
+  const showOfflineUnlockCard = Boolean(cachedOfflineUser && (!isOnline || isSessionLockedOffline));
+
   return (
     <div className="min-h-screen w-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4 relative overflow-y-auto">
       {/* Subtle decorative radial accent */}
@@ -119,10 +141,96 @@ export const FirebaseAuthGate: React.FC = () => {
           </h1>
           <p className="text-xs text-slate-400">
             {language === 'bn'
-              ? 'ফায়ারবেস অ্যাডমিন নিয়ন্ত্রিত লগইন সিস্টেম'
-              : 'Firebase Admin-Controlled Authentication & RBAC'}
+              ? 'অফলাইন-ফার্স্ট ও ফায়ারবেস নিরাপদ লগইন সিস্টেম'
+              : 'Offline-First SQLite & Firebase Controlled Authentication'}
           </p>
         </div>
+
+        {/* Offline Local Unlock Card when offline or terminal locked */}
+        {showOfflineUnlockCard && cachedOfflineUser && (
+          <form
+            onSubmit={handleOfflineUnlock}
+            className="bg-slate-900/95 border border-emerald-500/40 rounded-2xl shadow-2xl p-5 space-y-4"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center">
+                  {!isOnline ? (
+                    <WifiOff className="w-4 h-4 text-amber-400" />
+                  ) : (
+                    <LockKeyhole className="w-4 h-4 text-emerald-400" />
+                  )}
+                </div>
+                <div>
+                  <h2 className="text-xs font-bold text-white">
+                    {language === 'bn'
+                      ? 'অফলাইন লোকাল আনলক (Cached Session)'
+                      : 'Offline Local Unlock (Cached Session)'}
+                  </h2>
+                  <p className="text-[11px] text-slate-400">
+                    {!isOnline
+                      ? language === 'bn'
+                        ? 'ইন্টারনেট নেই — লোকাল SQLite ও ক্যাশ সেশন দিয়ে কাজ করুন'
+                        : 'Internet offline — continue working with local SQLite DB'
+                      : language === 'bn'
+                      ? 'লক করা সেশন আনলক করুন'
+                      : 'Unlock locked terminal session'}
+                  </p>
+                </div>
+              </div>
+              <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                {cachedOfflineUser.role}
+              </span>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/70 flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-300 font-bold text-xs shrink-0">
+                {cachedOfflineUser.name.slice(0, 2).toUpperCase()}
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-bold text-white truncate">{cachedOfflineUser.name}</p>
+                <p className="text-[11px] text-slate-400 font-mono truncate">{cachedOfflineUser.email}</p>
+              </div>
+            </div>
+
+            {hasOfflinePin && (
+              <div>
+                <label className="block text-slate-300 text-xs font-medium mb-1.5">
+                  {language === 'bn' ? 'অফলাইন পিন (৪-৬ সংখ্যা)' : 'Offline Unlock PIN (4-6 digits)'}
+                </label>
+                <div className="relative">
+                  <KeyRound className="w-4 h-4 text-emerald-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={offlinePinInput}
+                    onChange={(e) => setOfflinePinInput(e.target.value.replace(/\D/g, ''))}
+                    placeholder="••••"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-xl pl-9 pr-3 py-2.5 text-sm text-white font-mono tracking-widest focus:border-emerald-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={submitting}
+              className="w-full py-2.5 px-4 rounded-xl font-bold text-sm bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 shadow-lg shadow-emerald-500/20 transition-all flex items-center justify-center gap-2"
+            >
+              <Unlock className="w-4 h-4" />
+              <span>
+                {language === 'bn'
+                  ? hasOfflinePin
+                    ? 'পিন দিয়ে অফলাইনে প্রবেশ করুন'
+                    : 'অফলাইন মোডে প্রবেশ করুন'
+                  : hasOfflinePin
+                  ? 'Unlock Offline with PIN'
+                  : 'Continue Offline'}
+              </span>
+            </button>
+          </form>
+        )}
 
         {/* Auth Card */}
         <div className="bg-slate-900/95 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden">

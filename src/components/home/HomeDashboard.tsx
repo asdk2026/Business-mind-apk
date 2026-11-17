@@ -20,6 +20,7 @@ import { useApp } from '../../context/AppContext';
 import { Product } from '../../types';
 import { ProductDetailsModal } from '../product/ProductDetailsModal';
 import { ProductFormModal } from '../product/ProductFormModal';
+import { CachedImage } from '../common/CachedImage';
 
 interface HomeDashboardProps {
   onOpenPosWithProduct?: (product: Product) => void;
@@ -478,16 +479,12 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({ onOpenPosWithProdu
                 >
                   {/* LEFT: Small Product Image */}
                   <div className="w-full sm:w-28 h-28 sm:h-28 rounded-xl bg-slate-800/80 border border-slate-700/60 overflow-hidden flex items-center justify-center shrink-0 relative">
-                    {product.image_url ? (
-                      <img
-                        src={product.image_url}
-                        alt={product.name}
-                        referrerPolicy="no-referrer"
-                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                      />
-                    ) : (
-                      <Package className="w-8 h-8 text-slate-500" />
-                    )}
+                    <CachedImage
+                      src={product.image_url}
+                      alt={product.name}
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                      fallbackIconClassName="w-8 h-8 text-slate-500"
+                    />
                     <span className="absolute bottom-1 right-1 bg-black/70 backdrop-blur-xs text-[9px] font-mono text-slate-300 px-1.5 py-0.5 rounded">
                       {product.code}
                     </span>

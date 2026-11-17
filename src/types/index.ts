@@ -43,6 +43,7 @@ export interface Product {
   qualities: ProductQuality[];
   created_at: string;
   updated_at: string;
+  version?: number;
   is_deleted?: boolean;
 }
 
@@ -60,6 +61,8 @@ export interface Customer {
   total_paid: number;
   outstanding_due: number;
   created_at: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export interface Supplier {
@@ -73,6 +76,8 @@ export interface Supplier {
   total_paid: number;
   outstanding_due: number;
   created_at: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export interface InvoiceItem {
@@ -118,6 +123,7 @@ export interface Invoice {
   notes?: string;
   created_at: string;
   updated_at: string;
+  version?: number;
 }
 
 export interface PurchaseItem {
@@ -150,6 +156,8 @@ export interface Purchase {
   payment_status: 'paid' | 'partial' | 'due' | 'cancelled';
   notes?: string;
   created_at: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export type StockMovementType =
@@ -174,6 +182,8 @@ export interface StockMovement {
   reference_id?: string;
   notes?: string;
   timestamp: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export interface PaymentRecord {
@@ -189,6 +199,8 @@ export interface PaymentRecord {
   payment_date: string;
   payment_method: string;
   notes?: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export interface Expense {
@@ -202,6 +214,8 @@ export interface Expense {
   notes?: string;
   attachment_url?: string;
   created_at: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export interface BusinessSettings {
@@ -223,6 +237,8 @@ export interface BusinessSettings {
   auto_sync: boolean;
   auto_firebase_sync?: boolean;
   last_sync_time?: string;
+  updated_at?: string;
+  version?: number;
 }
 
 export interface SyncLog {
@@ -231,6 +247,49 @@ export interface SyncLog {
   action: string;
   status: 'synced' | 'pending' | 'failed';
   details: string;
+}
+
+export interface SyncQueueItem {
+  op_id: string;
+  collection_name: string;
+  doc_id: string;
+  op_type: 'upsert' | 'delete';
+  payload_json?: string;
+  version: number;
+  updated_at: string;
+  attempts: number;
+  last_error?: string;
+}
+
+export interface ConflictRecord {
+  id: string;
+  collection: string;
+  docId: string;
+  localVersion: number;
+  cloudVersion: number;
+  localUpdatedAt: string;
+  cloudUpdatedAt: string;
+  winner: 'local' | 'cloud';
+  resolvedAt: string;
+}
+
+export interface DatabaseSnapshotMeta {
+  id: string;
+  created_at: string;
+  reason: 'auto' | 'manual' | 'pre_restore';
+  size_bytes: number;
+  summary: string;
+}
+
+export interface SqliteStats {
+  engine: 'SQLite (sql.js WASM)';
+  initialized: boolean;
+  dbSizeBytes: number;
+  pendingQueueCount: number;
+  snapshotCount: number;
+  cachedImageCount: number;
+  tableCounts: Record<string, number>;
+  lastBackupAt: string | null;
 }
 
 export type AppNavigationModule =

@@ -22,6 +22,11 @@ import {
   Flame,
   ShieldCheck,
   Sliders,
+  History,
+  RotateCcw,
+  HardDrive,
+  FileArchive,
+  GitMerge,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { firebaseConfig } from '../../utils/firebase';
@@ -38,7 +43,6 @@ export const SettingsView: React.FC = () => {
     isOnline,
     syncStatus,
     triggerSyncNow,
-    syncLogs,
     exportDatabaseJson,
     importDatabaseJson,
     currentUser,
@@ -56,9 +60,19 @@ export const SettingsView: React.FC = () => {
     syncToFirebase,
     syncFromFirebase,
     lastFirebaseSync,
+    sqliteStats,
+    snapshots,
+    conflicts,
+    createManualSnapshot,
+    restoreFromSnapshot,
+    exportSqliteFile,
+    importSqliteFile,
   } = useApp();
 
   const canManageCloudSync = hasActionPermission('canManageCloudSync');
+  const [settingsMsg, setSettingsMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [recoveryMsg, setRecoveryMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [confirmRestoreId, setConfirmRestoreId] = useState<string | null>(null);
 
   // Local form states
   const [businessName, setBusinessName] = useState(settings.business_name);
@@ -91,7 +105,7 @@ export const SettingsView: React.FC = () => {
       allow_negative_stock: allowNegativeStock,
       auto_sync: autoSync,
     });
-    alert('Settings saved successfully!');
+    setSettingsMsg({ text: 'Settings saved to local SQLite database!', type: 'success' });
   };
 
   // Export JSON Backup
@@ -104,6 +118,7 @@ export const SettingsView: React.FC = () => {
     a.download = `BusinessMind_Backup_${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
+    setRecoveryMsg({ text: 'JSON backup exported successfully.', type: 'success' });
   };
 
   // Import JSON Backup
@@ -116,14 +131,82 @@ export const SettingsView: React.FC = () => {
         if (text) {
           const success = importDatabaseJson(text);
           if (success) {
-            alert('Database restored successfully from JSON backup!');
-            window.location.reload();
+            setRecoveryMsg({ text: 'Database restored successfully from JSON backup!', type: 'success' });
           } else {
-            alert('Invalid backup file. Please provide a valid Business Mind JSON export.');
+            setRecoveryMsg({ text: 'Invalid backup file. Please provide a valid Business Mind JSON export.', type: 'error' });
           }
         }
       };
       reader.readAsText(file);
+    }
+    e.target.value = '';
+  };
+
+  // Export Binary SQLite .sqlite file
+  const handleExportSqlite = () => {
+    const bytes = exportSqliteFile();
+    if (!bytes) {
+      setRecoveryMsg({ text: 'SQLite engine is still initializing. Try again shortly.', type: 'error' });
+      return;
+    }
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    const blob = new Blob([copy.buffer], { type: 'application/x-sqlite3' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `BusinessMind_SQLite_${new Date().toISOString().slice(0, 10)}.sqlite`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setRecoveryMsg({
+      text: `Exported native SQLite database (${(bytes.byteLength / 1024).toFixed(1)} KB).`,
+      type: 'success',
+    });
+  };
+
+  // Import Binary SQLite .sqlite file
+  const handleImportSqlite = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const buffer = event.target?.result as ArrayBuffer;
+        if (buffer) {
+          const ok = await importSqliteFile(new Uint8Array(buffer));
+          if (ok) {
+            setRecoveryMsg({ text: 'SQLite binary database restored cleanly!', type: 'success' });
+          } else {
+            setRecoveryMsg({ text: 'Invalid SQLite database file.', type: 'error' });
+          }
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+    e.target.value = '';
+  };
+
+  const handleCreateManualSnapshot = () => {
+    const snap = createManualSnapshot();
+    if (snap) {
+      setRecoveryMsg({
+        text: `Snapshot created (${snap.summary}).`,
+        type: 'success',
+      });
+    } else {
+      setRecoveryMsg({ text: 'Could not create SQLite snapshot.', type: 'error' });
+    }
+  };
+
+  const handleRestoreSnapshot = (snapshotId: string) => {
+    const ok = restoreFromSnapshot(snapshotId);
+    setConfirmRestoreId(null);
+    if (ok) {
+      setRecoveryMsg({
+        text: 'Restored database from snapshot! A safety pre-restore backup was also saved.',
+        type: 'success',
+      });
+    } else {
+      setRecoveryMsg({ text: 'Snapshot restore failed.', type: 'error' });
     }
   };
 
@@ -371,11 +454,18 @@ export const SettingsView: React.FC = () => {
             </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
             <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60">
               <span className="text-slate-400 block text-[11px]">Sync Status</span>
               <span className="font-semibold text-white mt-0.5 block capitalize">
-                {syncStatus === 'synced' ? t('syncStatusSynced') : t('syncStatusPending')}
+                {syncStatus === 'synced' ? t('syncStatusSynced') : syncStatus === 'syncing' ? 'Syncing...' : t('syncStatusPending')}
+              </span>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60">
+              <span className="text-slate-400 block text-[11px]">SQLite Sync Queue</span>
+              <span className="font-mono font-bold text-emerald-400 mt-0.5 block">
+                {sqliteStats.pendingQueueCount} Pending Ops
               </span>
             </div>
 
@@ -409,9 +499,9 @@ export const SettingsView: React.FC = () => {
             </div>
           </div>
 
-          <div className="flex items-center justify-between pt-1">
-            <p className="text-[11px] text-slate-400 max-w-md">
-              Local changes are safely recorded in offline IndexedDB. When online, transactions automatically sync without duplication.
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+            <p className="text-[11px] text-slate-400 max-w-lg">
+              All changes write synchronously to Local SQLite (`sync_queue`) with Record Version + Last Updated tracking. Background sync flushes automatically on reconnect.
             </p>
             <button
               type="button"
@@ -422,47 +512,255 @@ export const SettingsView: React.FC = () => {
               {syncStatus === 'syncing' ? 'Syncing...' : t('syncNow')}
             </button>
           </div>
+
+          {/* Conflict Resolution Log */}
+          <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                <GitMerge className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Conflict Resolution Log (Version & Last Updated)</span>
+              </span>
+              <span className="text-[10px] font-mono text-slate-400">
+                {conflicts.length} resolved
+              </span>
+            </div>
+            {conflicts.length === 0 ? (
+              <p className="text-[11px] text-slate-500">
+                No version conflicts detected. Local and Cloud record versions are consistent.
+              </p>
+            ) : (
+              <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                {conflicts.slice(0, 8).map((c) => (
+                  <div
+                    key={c.id}
+                    className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px]"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="px-1.5 py-0.5 rounded bg-slate-800 text-emerald-300 font-mono text-[10px]">
+                        {c.collection}
+                      </span>
+                      <span className="text-slate-300 font-mono truncate max-w-[140px]">{c.docId}</span>
+                      <span className="text-slate-500">
+                        v{c.localVersion} vs v{c.cloudVersion}
+                      </span>
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                        c.winner === 'local'
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-blue-500/15 text-blue-300'
+                      }`}
+                    >
+                      Winner: {c.winner}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* Section E: Database Backup & Restore */}
+        {/* Section E: Local SQLite Auto-Backup & Data Recovery Center */}
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-4 shadow-xs">
-          <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
-            <Database className="w-4 h-4 text-emerald-400" />
-            <h3 className="font-bold text-sm text-white">{t('backupAndRestore')}</h3>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-emerald-400" />
+              <h3 className="font-bold text-sm text-white">Local SQLite Auto-Backup & Data Recovery</h3>
+            </div>
+            <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+              {sqliteStats.initialized ? `${sqliteStats.engine} · ${(sqliteStats.dbSizeBytes / 1024).toFixed(1)} KB` : 'Initializing SQLite...'}
+            </span>
           </div>
 
+          {/* SQLite Storage Metrics */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+            <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60">
+              <span className="text-slate-400 block text-[10px]">SQLite Tables Rows</span>
+              <span className="font-mono font-bold text-white text-sm mt-0.5 block">
+                {Object.values(sqliteStats.tableCounts).reduce((sum, v) => sum + v, 0)}
+              </span>
+            </div>
+            <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60">
+              <span className="text-slate-400 block text-[10px]">Rolling Snapshots</span>
+              <span className="font-mono font-bold text-emerald-400 text-sm mt-0.5 block">
+                {sqliteStats.snapshotCount} / 10
+              </span>
+            </div>
+            <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60">
+              <span className="text-slate-400 block text-[10px]">Offline Cached Images</span>
+              <span className="font-mono font-bold text-blue-400 text-sm mt-0.5 block">
+                {sqliteStats.cachedImageCount}
+              </span>
+            </div>
+            <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60">
+              <span className="text-slate-400 block text-[10px]">Last Auto Snapshot</span>
+              <span className="font-mono text-slate-300 text-[11px] mt-1 block truncate">
+                {sqliteStats.lastBackupAt ? new Date(sqliteStats.lastBackupAt).toLocaleTimeString() : 'Scheduled'}
+              </span>
+            </div>
+          </div>
+
+          {recoveryMsg && (
+            <div
+              className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
+                recoveryMsg.type === 'success'
+                  ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                  : 'bg-rose-950/60 border-rose-500/40 text-rose-300'
+              }`}
+            >
+              {recoveryMsg.type === 'success' ? (
+                <CheckCircle className="w-4 h-4 shrink-0 text-emerald-400" />
+              ) : (
+                <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+              )}
+              <span>{recoveryMsg.text}</span>
+            </div>
+          )}
+
+          {/* Export / Import Controls (.sqlite + .json) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-            <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700/60 space-y-2">
-              <span className="font-bold text-white block">Export Database Backup</span>
+            <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700/60 space-y-2.5">
+              <div className="flex items-center gap-2">
+                <HardDrive className="w-4 h-4 text-emerald-400" />
+                <span className="font-bold text-white">Native SQLite Backup (.sqlite)</span>
+              </div>
               <p className="text-slate-400 text-[11px]">
-                Download a complete, offline-safe JSON backup of your entire store catalog, invoices, and customers.
+                Export or restore the complete local SQLite binary file including tables, sync queue & cached images.
               </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={handleExportSqlite}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Export .sqlite</span>
+                </button>
+                <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-700 hover:bg-slate-650 text-white transition-colors cursor-pointer">
+                  <Upload className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Import .sqlite</span>
+                  <input
+                    type="file"
+                    accept=".sqlite,.db"
+                    onChange={handleImportSqlite}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700/60 space-y-2.5">
+              <div className="flex items-center gap-2">
+                <FileArchive className="w-4 h-4 text-blue-400" />
+                <span className="font-bold text-white">Portable JSON Backup (.json)</span>
+              </div>
+              <p className="text-slate-400 text-[11px]">
+                Download or restore human-readable JSON snapshot of all products, invoices, customers & accounts.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={handleExportBackup}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-700 hover:bg-slate-650 text-white transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>{t('exportBackup')}</span>
+                </button>
+                <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-slate-700 hover:bg-slate-650 text-white transition-colors cursor-pointer">
+                  <Upload className="w-3.5 h-3.5 text-blue-400" />
+                  <span>{t('importBackup')}</span>
+                  <input
+                    type="file"
+                    accept=".json"
+                    onChange={handleImportBackup}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* Rolling Auto-Snapshots & 1-Click Recovery */}
+          <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <History className="w-4 h-4 text-emerald-400" />
+                <span className="font-bold text-xs text-white">Auto-Backup Snapshots (1-Click Restore)</span>
+              </div>
               <button
                 type="button"
-                onClick={handleExportBackup}
-                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-700 hover:bg-slate-650 text-white transition-colors"
+                onClick={handleCreateManualSnapshot}
+                className="px-3 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 transition-colors"
               >
-                <Download className="w-3.5 h-3.5 text-emerald-400" />
-                <span>{t('exportBackup')}</span>
+                + Create Snapshot Now
               </button>
             </div>
 
-            <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700/60 space-y-2">
-              <span className="font-bold text-white block">Import / Restore Backup</span>
-              <p className="text-slate-400 text-[11px]">
-                Upload a previously saved Business Mind JSON backup file to restore database records.
+            {snapshots.length === 0 ? (
+              <p className="text-[11px] text-slate-500">
+                No snapshots created yet. Auto-backups run automatically every 10 minutes once business data is recorded.
               </p>
-              <label className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-700 hover:bg-slate-650 text-white transition-colors cursor-pointer">
-                <Upload className="w-3.5 h-3.5 text-blue-400" />
-                <span>{t('importBackup')}</span>
-                <input
-                  type="file"
-                  accept=".json"
-                  onChange={handleImportBackup}
-                  className="hidden"
-                />
-              </label>
-            </div>
+            ) : (
+              <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                {snapshots.map((snap) => (
+                  <div
+                    key={snap.id}
+                    className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
+                            snap.reason === 'manual'
+                              ? 'bg-emerald-500/20 text-emerald-300'
+                              : snap.reason === 'pre_restore'
+                              ? 'bg-amber-500/20 text-amber-300'
+                              : 'bg-blue-500/20 text-blue-300'
+                          }`}
+                        >
+                          {snap.reason.replace('_', ' ')}
+                        </span>
+                        <span className="font-mono text-[11px] text-white">
+                          {new Date(snap.created_at).toLocaleString()}
+                        </span>
+                        <span className="text-[10px] text-slate-500 font-mono">
+                          {(snap.size_bytes / 1024).toFixed(1)} KB
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-0.5 truncate">{snap.summary}</p>
+                    </div>
+
+                    {confirmRestoreId === snap.id ? (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleRestoreSnapshot(snap.id)}
+                          className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-500 text-slate-950 hover:bg-emerald-400"
+                        >
+                          Confirm Restore
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmRestoreId(null)}
+                          className="px-2 py-1 rounded-lg text-[11px] bg-slate-800 text-slate-300 hover:bg-slate-700"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmRestoreId(snap.id)}
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 transition-colors"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Restore</span>
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -481,9 +779,29 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                Firebase Connected
+              <span
+                className={`px-2.5 py-0.5 rounded-full text-[10px] font-semibold border flex items-center gap-1 ${
+                  firebaseSyncStatus === 'disconnected' || !isOnline
+                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                    : firebaseSyncStatus === 'error'
+                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                    : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    !isOnline
+                      ? 'bg-amber-400'
+                      : firebaseSyncStatus === 'error'
+                      ? 'bg-rose-400'
+                      : 'bg-emerald-400 animate-pulse'
+                  }`}
+                />
+                {!isOnline
+                  ? 'Offline (SQLite Active)'
+                  : firebaseSyncStatus === 'syncing'
+                  ? 'Syncing Cloud...'
+                  : 'Firebase Connected'}
               </span>
             </div>
           </div>
@@ -564,7 +882,7 @@ export const SettingsView: React.FC = () => {
             <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60 space-y-1">
               <span className="text-slate-400 block text-[11px]">Sync Architecture</span>
               <span className="font-semibold text-emerald-400 block">Bi-directional Offline-First</span>
-              <span className="text-[10px] text-slate-500 block">IndexedDB local + Cloud backup</span>
+              <span className="text-[10px] text-slate-500 block">SQLite WASM + Cloud Queue</span>
             </div>
             <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700/60 space-y-1">
               <span className="text-slate-400 block text-[11px]">Last Cloud Sync</span>
@@ -662,11 +980,7 @@ export const SettingsView: React.FC = () => {
                 {categories.length > 1 && (
                   <button
                     type="button"
-                    onClick={() => {
-                      if (confirm(`Delete category "${cat}"?`)) {
-                        deleteCategory(cat);
-                      }
-                    }}
+                    onClick={() => deleteCategory(cat)}
                     className="p-1 text-slate-500 hover:text-rose-400 rounded transition-colors"
                     title={`Delete ${cat}`}
                   >
@@ -678,7 +992,7 @@ export const SettingsView: React.FC = () => {
           </div>
         </div>
 
-        {/* Section F: Invoice & Stock Settings */}
+        {/* Section H: Invoice & Stock Settings */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
             <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
@@ -746,7 +1060,7 @@ export const SettingsView: React.FC = () => {
           </div>
         </div>
 
-        {/* Section H: Firebase Admin System & Staff Access Control */}
+        {/* Section I: Firebase Admin System & Staff Access Control */}
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
             <div className="flex items-center gap-2">
@@ -759,7 +1073,7 @@ export const SettingsView: React.FC = () => {
                 onClick={() => setShowLoginModal(true)}
                 className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 transition-colors"
               >
-                View My Permissions
+                View My Permissions & PIN
               </button>
               {isAdmin && (
                 <button
@@ -800,6 +1114,20 @@ export const SettingsView: React.FC = () => {
             </div>
           )}
         </div>
+
+        {/* Save Feedback Banner */}
+        {settingsMsg && (
+          <div
+            className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
+              settingsMsg.type === 'success'
+                ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300'
+                : 'bg-rose-950/60 border-rose-500/40 text-rose-300'
+            }`}
+          >
+            <CheckCircle className="w-4 h-4 shrink-0 text-emerald-400" />
+            <span>{settingsMsg.text}</span>
+          </div>
+        )}
 
         {/* Save Bar */}
         <div className="pt-2 flex justify-end">
